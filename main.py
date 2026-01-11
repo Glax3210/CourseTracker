@@ -5,6 +5,7 @@ import uuid
 import subprocess
 import threading
 import re
+import base64  # Added for image conversion
 from datetime import date, datetime
 
 # =========================================================================
@@ -55,7 +56,6 @@ class CourseManager:
                         if 'last_update_date' not in c: c['last_update_date'] = today_str
                         if 'watched_today_count' not in c: c['watched_today_count'] = 0
                         if 'strikes_data' not in c: c['strikes_data'] = []
-                        # Legacy cleanup
                         if 'strikes' in c and isinstance(c['strikes'], int) and c['strikes'] > 0 and not c['strikes_data']:
                             for _ in range(c['strikes']): c['strikes_data'].append({'date': 'Legacy', 'videos': []})
                     return data
@@ -68,28 +68,19 @@ class CourseManager:
             json.dump(self.courses, f, indent=4)
 
     def get_video_files(self, folder):
-        """
-        Recursively finds all video files in folder and subfolders.
-        Returns a list of RELATIVE paths (e.g. "Subfolder\video.mp4")
-        sorted naturally.
-        """
         if not folder or not os.path.exists(folder):
             return []
         
         valid_exts = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm')
         files = []
 
-        # Walk through all directories
         for root, dirs, filenames in os.walk(folder):
             for filename in filenames:
                 if filename.lower().endswith(valid_exts):
-                    # Get full path
                     full_path = os.path.join(root, filename)
-                    # Convert to relative path (so we store "Module 1\Video.mp4")
                     rel_path = os.path.relpath(full_path, folder)
                     files.append(rel_path)
         
-        # Natural Sort (handles numbers correctly: 2.mp4 comes before 10.mp4)
         def natural_keys(text): 
             return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', text)]
         
@@ -119,7 +110,6 @@ class CourseManager:
                     curr = c['last_index']
                     quota = c['daily_quota']
 
-                    # 1. Strike for yesterday incomplete
                     if c['watched_today_count'] < quota:
                         missed = quota - c['watched_today_count']
                         start_m = curr + c['watched_today_count']
@@ -129,7 +119,6 @@ class CourseManager:
                             c['strikes_data'].append({'id':str(uuid.uuid4()), 'date':str(last_date), 'videos':missed_files})
                             c['last_index'] += missed
 
-                    # 2. Strike for skipped days
                     if days_passed > 1:
                         skipped = days_passed - 1
                         for _ in range(skipped):
@@ -153,6 +142,23 @@ class CourseManager:
             self.courses = active_courses
             self.save_data()
 
+    def get_image_base64(self, path):
+        """Converts local image path to Base64 string for HTML display"""
+        if not path or not os.path.exists(path):
+            return ""
+        try:
+            with open(path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                # Determine mime type roughly by extension
+                ext = os.path.splitext(path)[1].lower()
+                mime = "image/jpeg"
+                if ext == ".png": mime = "image/png"
+                elif ext == ".webp": mime = "image/webp"
+                elif ext == ".svg": mime = "image/svg+xml"
+                return f"data:{mime};base64,{encoded_string}"
+        except:
+            return ""
+
     def get_all_courses_with_stats(self):
         self.process_daily_schedule()
         enhanced = []
@@ -162,7 +168,6 @@ class CourseManager:
             quota = c.get('daily_quota', 3)
             watched = c.get('watched_today_count', 0)
             
-            # This now gets recursive files
             files = self.get_video_files(folder)
             total = len(files)
             
@@ -178,14 +183,17 @@ class CourseManager:
             cc['quota_display'] = f"{watched} / {quota}"
             cc['is_quota_met'] = watched >= quota
             cc['strikes_count'] = len(c.get('strikes_data', []))
+            
+            # Convert logo path to Base64 for display
             if 'logo' not in cc: cc['logo'] = ""
+            cc['logo_b64'] = self.get_image_base64(cc['logo']) if cc['logo'] else ""
+            
             enhanced.append(cc)
         return enhanced
 
     def play_file_by_name(self, course_id, filename):
         for c in self.courses:
             if c['id'] == course_id:
-                # Use join to handle subfolders correctly
                 path = os.path.join(c['folder'], filename)
                 if os.path.exists(path):
                     os.startfile(path)
@@ -242,7 +250,6 @@ class CourseManager:
                 files = self.get_video_files(c['folder'])
                 idx = c['last_index']
                 if idx < len(files):
-                    # Join handles subfolders
                     os.startfile(os.path.join(c['folder'], files[idx]))
                     return "success"
                 return "finished"
@@ -315,7 +322,7 @@ HTML_TEMPLATE = r"""
     .dropdown-menu.open { transform: scale(1); opacity: 1; pointer-events: auto; }
     dialog { border: none; border-radius: 1rem; padding: 0; background: transparent; }
     dialog::backdrop { background: rgba(0,0,0,0.5); backdrop-filter: blur(4px); }
-    .logo-img { width: 100%; height: 100%; object-fit: contain; }
+    .logo-img { width: 100%; height: 100%; object-fit: cover; } /* Changed to cover for better fit */
     @keyframes pulse-green { 0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); } 70% { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); } 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); } }
     .status-active { animation: pulse-green 2s infinite; background-color: #22c55e; }
     .status-paused { background-color: #ef4444; }
@@ -381,7 +388,8 @@ HTML_TEMPLATE = r"""
         courses.forEach(c => {
             const card = document.createElement('div');
             card.className = "group bg-white dark:bg-slate-800 rounded-2xl p-4 border border-slate-200 dark:border-slate-700 shadow-sm hover:shadow-xl hover:-translate-y-1 transition-all relative";
-            let logoHtml = c.logo ? `<img src="${c.logo}" class="logo-img" onerror="this.style.display='none'">` : `<div class="absolute inset-0 bg-indigo-100 dark:bg-slate-700 flex items-center justify-center"><span class="material-symbols-rounded text-6xl text-slate-400">school</span></div>`;
+            // Use logo_b64 instead of raw path
+            let logoHtml = c.logo_b64 ? `<img src="${c.logo_b64}" class="logo-img">` : `<div class="absolute inset-0 bg-indigo-100 dark:bg-slate-700 flex items-center justify-center"><span class="material-symbols-rounded text-6xl text-slate-400">school</span></div>`;
             
             let strikeHtml = '';
             if (c.strikes_count > 0) {
@@ -402,7 +410,7 @@ HTML_TEMPLATE = r"""
                     <div class="absolute top-2 right-2 px-2 py-1 bg-white/80 dark:bg-slate-800/80 backdrop-blur rounded-md text-[10px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-400 z-10">${c.platform}</div>
                 </div>
                 <div class="flex items-start justify-between">
-                    <h3 class="font-bold text-slate-800 dark:text-slate-200 line-clamp-1 mb-1" title="${c.name}">${c.name}</h3>
+                    <h3 class="font-bold text-slate-800 dark:text-slate-200 line-clamp-1 mb-1">${c.name}</h3>
                     <button onclick="toggleStatus(event, '${c.id}')" class="w-3 h-3 rounded-full ${c.status === 'active' ? 'status-active' : 'status-paused'} mt-1"></button>
                 </div>
                 <div class="space-y-2 mt-3">
@@ -438,7 +446,6 @@ HTML_TEMPLATE = r"""
         course.strikes_data.forEach(strike => {
             let videosHtml = "";
             strike.videos.forEach(vid => {
-                // Shorten file name slightly for display
                 let dispName = vid.split('\\').pop(); 
                 videosHtml += `
                     <div class="flex items-center justify-between py-2 border-b border-red-100/50 last:border-0">
