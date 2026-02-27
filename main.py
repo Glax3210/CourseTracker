@@ -6,17 +6,18 @@ import subprocess
 import webbrowser
 import re
 import base64
-from datetime import date, datetime
+import mimetypes
+from datetime import date, datetime, timedelta
 
 # =========================================================================
-# 1. SYSTEM SETUP & PATH HANDLING
+# 1. SYSTEM SETUP & PATH HANDLING (Strictly set to "A" Paths)
 # =========================================================================
-APP_NAME = "FocusFlow_Final"
+APP_NAME = "DailyVideoEnforcer"
 app_data = os.getenv('LOCALAPPDATA') or os.path.expanduser("~")
 DB_DIR = os.path.join(app_data, APP_NAME)
 if not os.path.exists(DB_DIR): os.makedirs(DB_DIR)
 
-DATA_PATH = os.path.join(DB_DIR, "courses_v3.json")
+DATA_PATH = os.path.join(DB_DIR, "courses.json")
 SETTINGS_PATH = os.path.join(DB_DIR, "settings.json")
 
 def get_settings():
@@ -36,7 +37,7 @@ except ImportError:
     import webview
 
 # =========================================================================
-# 2. ROBUST BACKEND ENGINE
+# 2. ROBUST BACKEND ENGINE (Exactly functioning like A)
 # =========================================================================
 class CourseManager:
     def __init__(self):
@@ -52,6 +53,8 @@ class CourseManager:
                         if 'strikes_data' not in c: c['strikes_data'] = []
                         if 'status' not in c: c['status'] = 'active'
                         if 'last_update_date' not in c: c['last_update_date'] = today
+                        if 'watched_today_count' not in c: c['watched_today_count'] = 0
+                        if 'last_index' not in c: c['last_index'] = 0
                     return data
             except: pass
         return []
@@ -80,16 +83,31 @@ class CourseManager:
             if today > last_d:
                 if c['status'] == 'active':
                     files = self.get_files(c['folder'])
-                    needed = c['daily_quota'] - c['watched_today_count']
-                    if needed > 0:
-                        start = c['last_index'] + c['watched_today_count']
-                        missed = files[start:start+needed]
-                        if missed:
-                            c['strikes_data'].append({'id':str(uuid.uuid4()), 'date':str(last_d), 'videos':missed})
-                            c['last_index'] += len(missed)
+                    total_files = len(files)
+                    
+                    # Accurately calculate missed videos for EVERY day skipped
+                    curr_d = last_d
+                    while curr_d < today:
+                        watched = c.get('watched_today_count', 0) if curr_d == last_d else 0
+                        needed = c.get('daily_quota', 3) - watched
+                        
+                        if needed > 0 and c.get('last_index', 0) < total_files:
+                            start = c['last_index']
+                            missed = files[start:start+needed]
+                            if missed:
+                                c['strikes_data'].append({
+                                    'id': str(uuid.uuid4()), 
+                                    'date': str(curr_d), 
+                                    'videos': missed
+                                })
+                                c['last_index'] += len(missed)
+                        
+                        curr_d += timedelta(days=1)
+                        
                 c['watched_today_count'] = 0
                 c['last_update_date'] = today_str
         
+        # Enforce exactly 5 strikes deletion rule
         self.courses = [c for c in self.courses if len(c.get('strikes_data', [])) < 5]
         self.save()
 
@@ -102,11 +120,15 @@ class CourseManager:
             c['progress'] = int((min(c['last_index'], total)/total)*100) if total > 0 else 0
             c['total_videos'] = total
             c['is_quota_met'] = c['watched_today_count'] >= c['daily_quota']
+            c['strikes_count'] = len(c.get('strikes_data', [])) # UI badge fix
+            
             c['logo_b64'] = ""
-            if c['logo'] and os.path.exists(c['logo']):
+            if c.get('logo') and os.path.exists(c['logo']):
                 try:
                     with open(c['logo'], "rb") as f:
-                        c['logo_b64'] = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+                        mime, _ = mimetypes.guess_type(c['logo'])
+                        if not mime: mime = "image/png"
+                        c['logo_b64'] = f"data:{mime};base64,{base64.b64encode(f.read()).decode()}"
                 except: pass
         return self.courses
 
@@ -119,7 +141,6 @@ class Api:
         import tkinter as tk; from tkinter import filedialog; r=tk.Tk(); r.withdraw()
         p=filedialog.askdirectory(); r.destroy(); return p
     def browse_l(self):
-        # FIX: Added specific image filters for the file dialog
         import tkinter as tk; from tkinter import filedialog; r=tk.Tk(); r.withdraw()
         p=filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
         r.destroy(); return p
@@ -164,7 +185,7 @@ class Api:
         self.cm.save(); return self.cm.get_data()
 
 # =========================================================================
-# 3. HIGH-CONTRAST GLOSSY FRONTEND
+# 3. HIGH-CONTRAST GLOSSY FRONTEND (100% untouched UI from B)
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -208,7 +229,7 @@ HTML_TEMPLATE = r"""
 <nav class="sticky top-0 z-50 glass h-16 flex items-center justify-between px-10 border-b dark:border-white/5">
    <div onclick="pywebview.api.open_link('https://github.com/Glax3210')" class="flex items-center gap-3 cursor-pointer hover:opacity-80 transition-all">
         <div class="w-9 h-9 bg-primary rounded-xl flex items-center justify-center shadow-lg shadow-primary/30"><span class="material-symbols-rounded text-white text-xl">rocket_launch</span></div>
-        <h1 class="text-xl font-black tracking-tighter">FocusFlow <span class="text-primary">Pro</span></h1>
+        <h1 class="text-xl font-black tracking-tighter">CourseTracker <span class="text-primary">Pro</span></h1>
     </div>
     <button onclick="toggleTheme()" class="w-10 h-10 rounded-full glass flex items-center justify-center hover:scale-110 transition-all border dark:border-white/10">
         <span class="material-symbols-rounded text-sm">wb_sunny</span>
@@ -477,5 +498,5 @@ if __name__ == '__main__':
     api = Api()
     cfg = get_settings()
     html = HTML_TEMPLATE.replace('__THEME__', cfg.get('theme', 'dark'))
-    window = webview.create_window('FocusFlow Pro', html=html, js_api=api, width=1300, height=850)
+    window = webview.create_window('CourseTracker Pro', html=html, js_api=api, width=1300, height=850)
     webview.start()
