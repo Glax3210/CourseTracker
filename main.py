@@ -806,7 +806,7 @@ HTML_TEMPLATE = r"""
 
                 <div style="flex:1; display:flex; flex-direction:column;">
                     <h3 class="card-title">
-                        ${c.name}
+                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;">${c.name}</span>
                         <button onclick="toggleS('${c.id}')" class="status-dot ${c.status==='active'?'status-active':'status-paused'}" title="Toggle Pause"></button>
                     </h3>
                     
