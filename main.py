@@ -7,25 +7,27 @@ import webbrowser
 import base64
 import mimetypes
 import threading
+import socket
+import http.server
+import socketserver
+import urllib.parse
 from datetime import date, datetime, timedelta
 
-# =========================================================================
-# 1. SYSTEM SETUP & PATH HANDLING
-# =========================================================================
-APP_NAME = "DailyVideoEnforcer"
+APP_NAME = "CourseTrackerPro"
 app_data = os.getenv('LOCALAPPDATA') or os.path.expanduser("~")
 DB_DIR = os.path.join(app_data, APP_NAME)
 if not os.path.exists(DB_DIR): os.makedirs(DB_DIR)
 
 DATA_PATH = os.path.join(DB_DIR, "courses.json")
 SETTINGS_PATH = os.path.join(DB_DIR, "settings.json")
+NOTES_CONFIG_PATH = os.path.join(DB_DIR, "notes_config.json")
 
 def get_settings():
     if os.path.exists(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH, 'r') as f: return json.load(f)
         except: pass
-    return {"theme": "dark"}
+    return {"theme": "dark", "notes_folder": ""}
 
 def save_settings(s):
     with open(SETTINGS_PATH, 'w') as f: json.dump(s, f)
@@ -42,8 +44,130 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "yt-dlp"])
     import yt_dlp
 
+try:
+    from spellchecker import SpellChecker
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyspellchecker"])
+    from spellchecker import SpellChecker
+
+spell = SpellChecker()
+
 # =========================================================================
-# 2. ROBUST BACKEND ENGINE
+# LOCAL FILE SERVER (serves videos to webview without CORS issues)
+# =========================================================================
+class VideoFileHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            filepath = params.get('f', [None])[0]
+            if filepath and os.path.exists(filepath):
+                try:
+                    with open(filepath, 'rb') as f:
+                        data = f.read()
+                    mime, _ = mimetypes.guess_type(filepath)
+                    if not mime:
+                        mime = 'video/mp4'
+                    self.send_response(200)
+                    self.send_header('Content-Type', mime)
+                    self.send_header('Content-Length', len(data))
+                    self.send_header('Accept-Ranges', 'bytes')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                except Exception:
+                    pass
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not found')
+        except Exception:
+            pass
+
+    def log_message(self, format, *args):
+        pass
+
+def start_file_server():
+    for port in range(18900, 18950):
+        try:
+            server = socketserver.TCPServer(('127.0.0.1', port), VideoFileHandler)
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            return port, server
+        except OSError:
+            continue
+    return None, None
+
+# =========================================================================
+# NOTES MANAGER
+# =========================================================================
+class NotesManager:
+    def __init__(self):
+        self.notes_folder = ""
+        self._load_config()
+
+    def _load_config(self):
+        if os.path.exists(NOTES_CONFIG_PATH):
+            try:
+                with open(NOTES_CONFIG_PATH, 'r') as f:
+                    c = json.load(f)
+                    self.notes_folder = c.get('folder', '')
+            except: pass
+
+    def _save_config(self):
+        with open(NOTES_CONFIG_PATH, 'w') as f:
+            json.dump({'folder': self.notes_folder}, f)
+
+    def set_folder(self, folder):
+        self.notes_folder = folder
+        self._save_config()
+        if folder and not os.path.exists(folder):
+            os.makedirs(folder)
+        return True
+
+    def _sanitize(self, name):
+        return "".join(c for c in name if c.isalnum() or c in ' _-').strip()
+
+    def save_note(self, course_name, video_title, video_index, content, is_youtube=False, youtube_url=''):
+        if not self.notes_folder: return ""
+        d = os.path.join(self.notes_folder, self._sanitize(course_name))
+        if not os.path.exists(d): os.makedirs(d)
+        base, _ = os.path.splitext(video_title or 'note')
+        fn = f"{self._sanitize(base)}.md"
+        p = os.path.join(d, fn)
+        h = f"# {video_title or 'Note'}\n**Course:** {course_name}  \n**Video:** {video_index}  \n"
+        if is_youtube and youtube_url: h += f"\n![]({youtube_url})\n"
+        h += "\n"
+        with open(p, 'w', encoding='utf-8') as f: f.write(h + content)
+        return p
+
+    def load_note(self, course_name, video_title, video_index):
+        if not self.notes_folder: return ""
+        d = os.path.join(self.notes_folder, self._sanitize(course_name))
+        base, _ = os.path.splitext(video_title or 'note')
+        fn = f"{self._sanitize(base)}.md"
+        p = os.path.join(d, fn)
+        if not os.path.exists(p): return ""
+        with open(p, 'r', encoding='utf-8') as f:
+            c = f.read()
+        i = c.index('\n\n') if '\n\n' in c else 0
+        return c[i + 2:] if i else c
+
+    def save_screenshot(self, course_name, video_title, img_b64):
+        if not self.notes_folder: return ""
+        d = os.path.join(self.notes_folder, self._sanitize(course_name))
+        if not os.path.exists(d): os.makedirs(d)
+        import re
+        ts = datetime.now().strftime("%H%M%S")
+        fn = f"{ts}_{self._sanitize(video_title or 'screenshot')}.png"
+        p = os.path.join(d, fn)
+        b64 = re.sub(r'^data:image/\w+;base64,', '', img_b64)
+        raw = base64.b64decode(b64)
+        with open(p, 'wb') as f: f.write(raw)
+        return p
+
+# =========================================================================
+# COURSE MANAGER
 # =========================================================================
 class CourseManager:
     def __init__(self):
@@ -64,6 +188,7 @@ class CourseManager:
                         if 'last_index' not in c: c['last_index'] = 0
                         if 'type' not in c: c['type'] = 'offline'
                         if 'urls' not in c: c['urls'] =[]
+                        if 'notes_folder' not in c: c['notes_folder'] = ''
                         c.pop('fetched_videos', None) 
                     return data
             except: pass
@@ -74,20 +199,13 @@ class CourseManager:
 
     def fetch_online_videos(self, url):
         try:
-            ydl_opts = {
-                'extract_flat': 'in_playlist',
-                'quiet': True,
-                'no_warnings': True,
-                'ignoreerrors': True
-            }
+            ydl_opts = {'extract_flat': 'in_playlist', 'quiet': True, 'no_warnings': True, 'ignoreerrors': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if not info: return[url]
-                
                 if 'entries' in info and info['entries']:
                     return[e['url'] for e in info['entries'] if e.get('url')]
-                else:
-                    return[info.get('webpage_url', url)]
+                return[info.get('webpage_url', url)]
         except Exception:
             return [url]
 
@@ -96,70 +214,54 @@ class CourseManager:
             cid = c['id']
             if force_refresh or cid not in self.session_cache:
                 vids =[]
-                for u in c.get('urls',[]):
-                    vids.extend(self.fetch_online_videos(u))
+                for u in c.get('urls',[]): vids.extend(self.fetch_online_videos(u))
                 self.session_cache[cid] = vids
             return self.session_cache[cid]
         else:
             import re
             folder = c.get('folder')
             if not folder or not os.path.exists(folder): return[]
-            exts = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm')
+            exts = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm', '.flv', '.m4v', '.ts')
             found =[]
             for r, _, fnames in os.walk(folder):
                 for fn in fnames:
                     if fn.lower().endswith(exts):
                         found.append(os.path.relpath(os.path.join(r, fn), folder))
-            found.sort(key=lambda text:[int(x) if x.isdigit() else x for x in re.split(r'(\d+)', text)])
+            found.sort(key=lambda t:[int(x) if x.isdigit() else x for x in re.split(r'(\d+)', t)])
             return found
 
     def refresh_logic(self, mode):
-        today = date.today()
-        today_str = str(today)
+        today = date.today(); today_str = str(today)
         for c in self.courses:
             if c.get('type', 'offline') != mode: continue
-
             try: last_d = datetime.strptime(c['last_update_date'], "%Y-%m-%d").date()
             except: last_d = today
-            
             if today > last_d:
                 if c['status'] == 'active':
                     files = self.get_files(c, force_refresh=True)
                     total_files = len(files)
-                    
                     curr_d = last_d
                     while curr_d < today:
                         watched = c.get('watched_today_count', 0) if curr_d == last_d else 0
                         needed = c.get('daily_quota', 3) - watched
-                        
                         if needed > 0 and c.get('last_index', 0) < total_files:
                             start = c['last_index']
                             missed = files[start:start+needed]
                             if missed:
-                                c['strikes_data'].append({
-                                    'id': str(uuid.uuid4()), 
-                                    'date': str(curr_d), 
-                                    'videos': missed
-                                })
+                                c['strikes_data'].append({'id': str(uuid.uuid4()), 'date': str(curr_d), 'videos': missed})
                                 c['last_index'] += len(missed)
                         curr_d += timedelta(days=1)
-                        
                 c['watched_today_count'] = 0
                 c['last_update_date'] = today_str
-        
         self.courses =[c for c in self.courses if len(c.get('strikes_data', [])) < 5]
         self.save()
 
     def get_data(self, mode="offline", clear_cache=False):
-        if clear_cache and mode == "online":
-            self.session_cache.clear()
-
+        if clear_cache and mode == "online": self.session_cache.clear()
         self.refresh_logic(mode)
-        
         result =[]
         for c in self.courses:
             if c.get('type', 'offline') != mode: continue
-
             files = self.get_files(c)
             total = len(files)
             if c['last_index'] > total: c['last_index'] = total
@@ -167,11 +269,9 @@ class CourseManager:
             c['total_videos'] = total
             c['is_quota_met'] = c['watched_today_count'] >= c['daily_quota']
             c['strikes_count'] = len(c.get('strikes_data',[]))
-            
             c['logo_b64'] = ""
             if c.get('logo'):
-                if c['logo'].startswith('http'):
-                    c['logo_b64'] = c['logo']
+                if c['logo'].startswith('http'): c['logo_b64'] = c['logo']
                 elif os.path.exists(c['logo']):
                     try:
                         with open(c['logo'], "rb") as f:
@@ -179,15 +279,32 @@ class CourseManager:
                             if not mime: mime = "image/png"
                             c['logo_b64'] = f"data:{mime};base64,{base64.b64encode(f.read()).decode()}"
                     except: pass
-            
             result.append(c)
         return result
 
+    def get_video_abs_path(self, course_id, video_index):
+        c = next((x for x in self.courses if x['id'] == course_id), None)
+        if not c: return None
+        files = self.get_files(c)
+        if video_index >= len(files): return None
+        target = files[video_index]
+        if target.startswith('http'): return target
+        return os.path.join(c.get('folder', ''), target)
+
+# =========================================================================
+# API
+# =========================================================================
 class Api:
     def __init__(self): 
         self.cm = CourseManager()
+        self.nm = NotesManager()
         self._window = None 
+        self._file_port = None
 
+    def set_file_port(self, port):
+        self._file_port = port
+
+    # --- original ---
     def open_link(self, url): webbrowser.open(url)
     
     def get_courses_async(self, mode="offline", clear_cache=False): 
@@ -200,13 +317,49 @@ class Api:
         return self.cm.get_data(mode, False)
         
     def set_theme(self, t): s = get_settings(); s['theme'] = t; save_settings(s); return True
+
     def browse_f(self):
-        import tkinter as tk; from tkinter import filedialog; r=tk.Tk(); r.withdraw()
-        p=filedialog.askdirectory(); r.destroy(); return p
+        try:
+            if hasattr(webview, 'FileDialog'):
+                res = self._window.create_file_dialog(webview.FileDialog.FOLDER, directory='')
+            else:
+                res = self._window.create_file_dialog(webview.FOLDER_DIALOG, directory='')
+            return res[0] if res else ''
+        except:
+            import tkinter as tk; from tkinter import filedialog
+            r = tk.Tk(); r.withdraw(); p = filedialog.askdirectory(); r.destroy(); return p
+
     def browse_l(self):
-        import tkinter as tk; from tkinter import filedialog; r=tk.Tk(); r.withdraw()
-        p=filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
-        r.destroy(); return p
+        try:
+            if hasattr(webview, 'FileDialog'):
+                res = self._window.create_file_dialog(webview.FileDialog.OPEN, file_types=('Images (*.png;*.jpg;*.jpeg)',))
+            else:
+                res = self._window.create_file_dialog(webview.OPEN_DIALOG, file_types=('Images (*.png;*.jpg;*.jpeg)',))
+            return res[0] if res else ''
+        except:
+            import tkinter as tk; from tkinter import filedialog
+            r = tk.Tk(); r.withdraw()
+            p = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
+            r.destroy(); return p
+
+    def browse_notes_folder(self):
+        try:
+            if hasattr(webview, 'FileDialog'):
+                res = self._window.create_file_dialog(webview.FileDialog.FOLDER, directory='')
+            else:
+                res = self._window.create_file_dialog(webview.FOLDER_DIALOG, directory='')
+            return res[0] if res else ''
+        except:
+            import tkinter as tk; from tkinter import filedialog
+            r = tk.Tk(); r.withdraw(); p = filedialog.askdirectory(); r.destroy(); return p
+
+    def get_app_info(self):
+        cfg = get_settings()
+        return {
+            'theme': cfg.get('theme', 'dark'),
+            'notes_folder': self.nm.notes_folder,
+            'file_port': self._file_port
+        }
 
     def fetch_meta(self, url):
         try:
@@ -218,35 +371,32 @@ class Api:
                 if info.get('thumbnails'): image = info['thumbnails'][-1].get('url', '')
                 elif info.get('entries'):
                     entries = list(info['entries'])
-                    if entries and entries[0].get('thumbnails'):
-                        image = entries[0]['thumbnails'][-1].get('url', '')
+                    if entries and entries[0].get('thumbnails'): image = entries[0]['thumbnails'][-1].get('url', '')
                 return {"title": title, "image": image}
         except Exception:
             return {"title": "", "image": ""}
 
-    def add_c(self, n, p, f, q, l, c_type, urls, mode):
+    def add_c(self, n, p, f, q, l, c_type, urls, notes_folder, mode):
         if c_type == 'online' and urls and not n:
             meta = self.fetch_meta(urls[0])
             n = meta['title'] or "Online Course"
             if not l and meta['image']: l = meta['image']
         if not p: p = "Online" if c_type == 'online' else "Local"
-            
         c_id = str(uuid.uuid4())
         self.cm.courses.append({
-            "id":c_id, "name":n, "platform":p, "folder":f, 
-            "type":c_type, "urls":urls, "daily_quota":int(q), 
-            "logo":l, "last_index":0, "status":"active", "last_update_date":str(date.today()), 
-            "watched_today_count":0, "strikes_data":[]
+            "id":c_id, "name":n, "platform":p, "folder":f,
+            "type":c_type, "urls":urls, "daily_quota":int(q),
+            "logo":l, "last_index":0, "status":"active", "last_update_date":str(date.today()),
+            "watched_today_count":0, "strikes_data":[], "notes_folder": notes_folder
         })
         self.cm.save(); return self.cm.get_data(mode)
 
-    def update_c(self, i, n, p, f, q, l, c_type, urls, mode):
+    def update_c(self, i, n, p, f, q, l, c_type, urls, notes_folder, mode):
         for c in self.cm.courses:
             if c['id']==i: 
                 c['name']=n; c['platform']=p; c['folder']=f; c['daily_quota']=int(q); c['logo']=l
-                c['type']=c_type; c['urls']=urls
-                self.cm.session_cache.pop(i, None)
-                break
+                c['type']=c_type; c['urls']=urls; c['notes_folder']=notes_folder
+                self.cm.session_cache.pop(i, None); break
         self.cm.save(); return self.cm.get_data(mode)
 
     def delete_c(self, i, mode):
@@ -258,23 +408,15 @@ class Api:
             if c['id']==i: c['status'] = 'paused' if c['status']=='active' else 'active'
         self.cm.save(); return self.cm.get_data(mode)
 
-    def open_target(self, folder, target):
-        if target.startswith('http://') or target.startswith('https://'):
-            webbrowser.open(target)
-            return True
-        else:
-            path = os.path.join(folder, target) if folder else target
-            if os.path.exists(path):
-                os.startfile(path)
-                return True
-            return False
-
     def play(self, i):
         for c in self.cm.courses:
             if c['id']==i:
                 fs = self.cm.get_files(c)
                 if c['last_index'] < len(fs):
-                    return self.open_target(c.get('folder', ''), fs[c['last_index']])
+                    target = fs[c['last_index']]
+                    if target.startswith('http'): webbrowser.open(target); return True
+                    path = os.path.join(c.get('folder', ''), target)
+                    if os.path.exists(path): os.startfile(path); return True
         return False
         
     def play_specific(self, i, index):
@@ -282,18 +424,16 @@ class Api:
             if c['id'] == i:
                 fs = self.cm.get_files(c)
                 if index < len(fs):
-                    return self.open_target(c.get('folder', ''), fs[index])
+                    target = fs[index]
+                    if target.startswith('http'): webbrowser.open(target); return True
+                    path = os.path.join(c.get('folder', ''), target)
+                    if os.path.exists(path): os.startfile(path); return True
         return False
 
     def reset_progress(self, i, mode):
         for c in self.cm.courses:
-            if c['id'] == i:
-                c['last_index'] = 0
-                c['watched_today_count'] = 0
-                c['strikes_data'] =[]
-                break
-        self.cm.save()
-        return self.cm.get_data(mode)
+            if c['id'] == i: c['last_index'] = 0; c['watched_today_count'] = 0; c['strikes_data'] =[]; break
+        self.cm.save(); return self.cm.get_data(mode)
 
     def mark(self, i, mode):
         for c in self.cm.courses:
@@ -302,7 +442,10 @@ class Api:
 
     def play_strike(self, i, fn):
         for c in self.cm.courses:
-            if c['id']==i: return self.open_target(c.get('folder', ''), fn)
+            if c['id']==i:
+                if fn.startswith('http'): webbrowser.open(fn); return True
+                path = os.path.join(c.get('folder', ''), fn)
+                if os.path.exists(path): os.startfile(path); return True
         return False
 
     def resolve(self, i, si, fn, mode):
@@ -315,9 +458,59 @@ class Api:
                         break
         self.cm.save(); return self.cm.get_data(mode)
 
+    # --- player ---
+    def player_get_video(self, course_id, video_index):
+        target = self.cm.get_video_abs_path(course_id, video_index)
+        if target is None: return {'ok': False, 'error': 'Video not found'}
+        c = next((x for x in self.cm.courses if x['id'] == course_id), None)
+        name = c['name'] if c else ''
+        if target.startswith('http'):
+            try:
+                ydl_opts = {'quiet': True, 'no_warnings': True, 'format': 'best[height<=1080]/best', 'socket_timeout': 15}
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(target, download=False)
+                    stream_url = info.get('url')
+                    if stream_url:
+                        return {
+                            'ok': True, 'is_youtube': False, 'url': stream_url,
+                            'title': info.get('title', 'YouTube Video'),
+                            'course_name': name, 'video_index': video_index
+                        }
+            except: pass
+            return {'ok': True, 'is_youtube': True, 'url': target, 'course_name': name, 'video_index': video_index}
+        if not os.path.exists(target): return {'ok': False, 'error': 'File not found'}
+        local_url = f"http://127.0.0.1:{self._file_port}/video?f={urllib.parse.quote(target)}"
+        return {
+            'ok': True, 'is_youtube': False, 'url': local_url,
+            'title': os.path.basename(target), 'course_name': name, 'video_index': video_index
+        }
+
+    # --- notes ---
+    def notes_set_folder(self, folder): self.nm.set_folder(folder); return True
+    def notes_get_folder(self): return self.nm.notes_folder
+    def notes_save(self, course_name, video_title, video_index, content, is_youtube=False, youtube_url=''):
+        path = self.nm.save_note(course_name, video_title, int(video_index), content, is_youtube, youtube_url)
+        return {'path': path, 'success': bool(path)}
+    def notes_load(self, course_name, video_title, video_index):
+        return {'content': self.nm.load_note(course_name, video_title, int(video_index))}
+    def notes_save_image(self, course_name, video_title, img_b64):
+        path = self.nm.save_screenshot(course_name, video_title, img_b64)
+        return {'path': path}
+
+    def js_log(self, msg): print(f"[JS] {msg}", flush=True)
+
+    def spell_check(self, word):
+        try:
+            if not word or len(word) < 3:
+                return {'known': True, 'suggestions': []}
+            known = word in spell
+            sugs = list(spell.candidates(word))[:5] if not known else []
+            return {'known': known, 'suggestions': sugs}
+        except:
+            return {'known': True, 'suggestions': []}
 
 # =========================================================================
-# 3. HIGH-CONTRAST GLOSSY FRONTEND 
+# HTML TEMPLATE
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -326,235 +519,237 @@ HTML_TEMPLATE = r"""
     <meta charset="utf-8"/><meta content="width=device-width, initial-scale=1.0" name="viewport"/>
     <style>
         :root {
-            /* Light theme vars */
-            --bg: #f8fafc;
-            --glass: rgba(255, 255, 255, 0.85);
-            --text-main: #1e293b;
-            --text-muted: #64748b;
-            --primary: #8b5cf6;
-            --primary-hover: #7c3aed;
-            --secondary: #3b82f6;
-            --card-bg: rgba(255, 255, 255, 0.6);
-            --border: rgba(0,0,0,0.08);
-            --danger: #ef4444;
-            --danger-bg: #fef2f2;
-            --success: #22c55e;
-            --input-bg: #f1f5f9;
+            --bg: #f8fafc; --glass: rgba(255,255,255,0.85); --text-main: #1e293b; --text-muted: #64748b;
+            --primary: #8b5cf6; --primary-hover: #7c3aed; --secondary: #3b82f6;
+            --card-bg: rgba(255,255,255,0.6); --border: rgba(0,0,0,0.08); --danger: #ef4444;
+            --danger-bg: #fef2f2; --success: #22c55e; --input-bg: #f1f5f9; --notes-bg: #ffffff;
         }
         .dark {
-            /* Dark theme vars */
-            --bg: #08080a;
-            --glass: rgba(18, 18, 24, 0.8);
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --card-bg: rgba(255, 255, 255, 0.03);
-            --border: rgba(255,255,255,0.08);
-            --danger-bg: rgba(239, 68, 68, 0.1);
-            --input-bg: rgba(0,0,0,0.4);
-        }
-        
-        body {
-            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--bg);
-            color: var(--text-main);
-            margin: 0; padding: 0; min-height: 100vh;
-            transition: background-color 0.3s, color 0.3s;
+            --bg: #08080a; --glass: rgba(18,18,24,0.8); --text-main: #f8fafc; --text-muted: #94a3b8;
+            --card-bg: rgba(255,255,255,0.03); --border: rgba(255,255,255,0.08);
+            --danger-bg: rgba(239,68,68,0.1); --input-bg: rgba(0,0,0,0.4); --notes-bg: #0f0f14;
         }
         * { box-sizing: border-box; }
+        body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg); color: var(--text-main); margin: 0; padding: 0; min-height: 100vh; transition: background-color 0.3s, color 0.3s; }
         .hidden { display: none !important; }
-        
-        .flex { display: flex; }
-        .flex-row { display: flex; gap: 0.75rem; }
-        .flex-1 { flex: 1; }
-        .items-center { align-items: center; }
-        .justify-between { justify-content: space-between; }
-        .justify-center { justify-content: center; }
-        .text-center { text-align: center; }
-        .w-full { width: 100%; }
-        .mb-2 { margin-bottom: 0.5rem; }
-        .mb-4 { margin-bottom: 1rem; }
-        .mt-4 { margin-top: 1rem; }
-        
+        .flex { display: flex; } .flex-row { display: flex; gap: 0.75rem; } .flex-1 { flex: 1; }
+        .items-center { align-items: center; } .justify-between { justify-content: space-between; }
+        .justify-center { justify-content: center; } .text-center { text-align: center; } .w-full { width: 100%; }
+        .mb-2 { margin-bottom: 0.5rem; } .mb-4 { margin-bottom: 1rem; } .mt-4 { margin-top: 1rem; }
         h1, h2, h3, h4, p { margin: 0; }
-        .text-xl { font-size: 1.25rem; font-weight: 900; }
-        .text-danger { color: var(--danger); }
-        .text-muted { color: var(--text-muted); }
-        
+        .text-danger { color: var(--danger); } .text-muted { color: var(--text-muted); }
         svg { width: 20px; height: 20px; flex-shrink: 0; }
-
-        .navbar {
-            display: flex; justify-content: space-between; align-items: center;
-            height: 64px; padding: 0 2.5rem;
-            background: var(--glass); backdrop-filter: blur(25px);
-            border-bottom: 1px solid var(--border);
-            position: sticky; top: 0; z-index: 50;
-        }
+        .navbar { display: flex; justify-content: space-between; align-items: center; height: 64px; padding: 0 2.5rem; background: var(--glass); backdrop-filter: blur(25px); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 50; }
         .nav-left, .nav-right { display: flex; align-items: center; gap: 1.5rem; }
-        
-        .btn-icon {
-            width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
-            background: transparent; border: 1px solid var(--border); color: var(--text-main);
-            cursor: pointer; transition: 0.2s;
-        }
+        .btn-icon { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: transparent; border: 1px solid var(--border); color: var(--text-main); cursor: pointer; transition: 0.2s; }
         .btn-icon:hover { background: var(--border); transform: scale(1.1); }
-        
-        .btn-mode {
-            display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1.25rem; border-radius: 2rem;
-            border: 1px solid var(--border); background: var(--glass); cursor: pointer; color: var(--text-muted); font-weight: bold; transition: 0.2s; box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-        }
+        .btn-mode { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1.25rem; border-radius: 2rem; border: 1px solid var(--border); background: var(--glass); cursor: pointer; color: var(--text-muted); font-weight: bold; transition: 0.2s; }
         .btn-mode:hover { color: var(--primary); transform: scale(1.05); }
-        .btn-mode.online { color: var(--success); border-color: rgba(34, 197, 94, 0.3); }
+        .btn-mode.online { color: var(--success); border-color: rgba(34,197,94,0.3); }
         .btn-mode.disabled { pointer-events: none; opacity: 0.8; }
-
         .btn { padding: 1.25rem 2rem; border-radius: 1.5rem; border: none; font-weight: 800; cursor: pointer; transition: 0.3s; text-align: center; font-size: 0.9rem; position: relative; overflow: hidden; }
         .btn:disabled { opacity: 0.6; pointer-events: none; }
         .btn::after { content: ""; position: absolute; top: -50%; left: -150%; width: 200%; height: 200%; background: linear-gradient(45deg, transparent, rgba(255,255,255,0.3), transparent); transform: rotate(45deg); transition: 0.8s; }
         .btn:hover::after { left: 150%; }
-        
-        .btn-primary { background: var(--primary); color: white; box-shadow: 0 4px 15px rgba(139, 92, 246, 0.3); }
+        .btn-primary { background: var(--primary); color: white; box-shadow: 0 4px 15px rgba(139,92,246,0.3); }
         .btn-primary:hover { background: var(--primary-hover); transform: translateY(-2px); }
-        .btn-danger { background: var(--danger); color: white; box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3); }
+        .btn-danger { background: var(--danger); color: white; }
         .btn-outline { background: transparent; color: var(--text-muted); }
         .btn-outline:hover { color: var(--text-main); }
         .btn-small { padding: 0.5rem 1rem; border-radius: 0.75rem; font-size: 0.75rem; }
-
+        .btn-xs { padding: 0.35rem 0.75rem; border-radius: 0.5rem; font-size: 0.7rem; }
         .container { max-width: 1440px; margin: 0 auto; padding: 2.5rem; }
         .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 2rem; }
-        
-        .card {
-            background: var(--card-bg); border: 1px solid var(--border); border-radius: 2.5rem; padding: 1.5rem;
-            display: flex; flex-direction: column; position: relative; transition: 0.3s;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.04); min-height: 340px;
-        }
+        .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 2.5rem; padding: 1.5rem; display: flex; flex-direction: column; position: relative; transition: 0.3s; min-height: 340px; }
         .dark .card { box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
         .card:hover { border-color: var(--primary); transform: translateY(-5px); }
-        
-        .card-add { align-items: center; justify-content: center; border: 2px dashed var(--border); cursor: pointer; text-align: center; }
+        .card-add { align-items: center; justify-content: center; border: 2px dashed var(--border); cursor: pointer; }
         .card-add:hover { border-color: var(--primary); }
-        .card-add-icon { width: 64px; height: 64px; border-radius: 1.5rem; background: rgba(139, 92, 246, 0.1); display: flex; align-items: center; justify-content: center; color: var(--primary); margin-bottom: 1rem; transition: 0.3s; }
+        .card-add-icon { width: 64px; height: 64px; border-radius: 1.5rem; background: rgba(139,92,246,0.1); display: flex; align-items: center; justify-content: center; color: var(--primary); margin-bottom: 1rem; transition: 0.3s; }
         .card-add-icon svg { width: 36px; height: 36px; }
         .card-add:hover .card-add-icon { transform: scale(1.1); }
-        
         .card-actions { position: absolute; top: 1.25rem; right: 1.25rem; display: flex; gap: 0.5rem; z-index: 10; }
-        .card-action-btn { width: 36px; height: 36px; border-radius: 1rem; background: var(--glass); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--text-muted); transition: 0.2s; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }
+        .card-action-btn { width: 36px; height: 36px; border-radius: 1rem; background: var(--glass); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--text-muted); transition: 0.2s; }
         .card-action-btn:hover { color: var(--primary); transform: scale(1.1); border-color: var(--primary); }
         .card-action-btn.delete:hover { color: white; background: var(--danger); border-color: var(--danger); }
-        
+        .card-action-btn.player:hover { color: white; background: var(--secondary); border-color: var(--secondary); }
         .card-img-wrapper { height: 144px; border-radius: 2rem; overflow: hidden; position: relative; background: var(--input-bg); margin-bottom: 1.25rem; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; }
         .card-img-wrapper img { width: 100%; height: 100%; object-fit: cover; }
         .card-platform { position: absolute; bottom: 1rem; left: 1rem; background: rgba(0,0,0,0.6); backdrop-filter: blur(5px); color: white; font-size: 0.65rem; font-weight: 900; padding: 0.3rem 0.75rem; border-radius: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
-        
         .card-title { font-size: 1.25rem; font-weight: 900; margin: 0 0 0.5rem 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
         .status-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; cursor: pointer; margin-top: 4px; border: none; }
         .status-active { background: var(--success); box-shadow: 0 0 12px var(--success); }
         .status-paused { background: var(--danger); }
-        
         .progress-info { display: flex; justify-content: space-between; font-size: 0.7rem; font-weight: 900; color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.5rem; letter-spacing: -0.5px; }
         .progress-bar-bg { width: 100%; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-bottom: 1.5rem; }
         .progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--primary), var(--secondary)); transition: width 0.3s; }
-        
-        .quota-box { background: var(--glass); padding: 1.25rem; border-radius: 2rem; border: 1px solid var(--border); margin-top: auto; box-shadow: 0 2px 5px rgba(0,0,0,0.02); }
+        .quota-box { background: var(--glass); padding: 1.25rem; border-radius: 2rem; border: 1px solid var(--border); margin-top: auto; }
         .quota-info { display: flex; justify-content: space-between; font-size: 0.7rem; font-weight: 900; margin-bottom: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
-        .quota-met .btn-primary { background: rgba(34, 197, 94, 0.1); color: var(--success); box-shadow: none; border: none; }
-        
-        .strike-badge { position: absolute; top: -12px; right: -12px; background: var(--danger); color: white; padding: 0.5rem 1rem; border-radius: 2rem; font-size: 0.7rem; font-weight: 900; z-index: 20; display: flex; align-items: center; gap: 0.5rem; box-shadow: 0 4px 15px rgba(239, 68, 68, 0.4); cursor: pointer; animation: shake 0.4s infinite; border: none; outline: none; }
-        
-        /* ==========================================================
-           REWRITTEN MODAL SYSTEM (Div overlays instead of Dialogs)
-           ========================================================== */
-        .modal-overlay {
-            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.7); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-            display: flex; align-items: center; justify-content: center;
-            z-index: 1000;
-            opacity: 0; pointer-events: none; transition: 0.2s ease-in-out;
-            padding: 2rem;
-        }
-        .modal-overlay.active {
-            opacity: 1; pointer-events: auto;
-        }
-        
-        /* Force Confirm Modal above everything else */
+        .quota-met .btn-primary { background: rgba(34,197,94,0.1); color: var(--success); box-shadow: none; border: none; }
+        .strike-badge { position: absolute; top: -12px; right: -12px; background: var(--danger); color: white; padding: 0.5rem 1rem; border-radius: 2rem; font-size: 0.7rem; font-weight: 900; z-index: 20; display: flex; align-items: center; gap: 0.5rem; box-shadow: 0 4px 15px rgba(239,68,68,0.4); cursor: pointer; animation: shake 0.4s infinite; border: none; outline: none; }
+        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; z-index: 1000; opacity: 0; pointer-events: none; transition: 0.2s ease-in-out; padding: 2rem; }
+        .modal-overlay.active { opacity: 1; pointer-events: auto; }
         #modal-confirm { z-index: 2000; }
-        
-        .modal-content {
-            background: var(--glass); border: 1px solid var(--border); border-radius: 3rem;
-            padding: 2.5rem; width: 100%; max-height: 90vh; overflow-y: auto;
-            box-shadow: 0 25px 50px rgba(0,0,0,0.25);
-            transform: scale(0.95) translateY(10px); transition: 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-            color: var(--text-main);
-        }
-        .modal-overlay.active .modal-content {
-            transform: scale(1) translateY(0);
-        }
-
-        .modal-sm { max-width: 400px; }
-        .modal-md { max-width: 450px; }
-        .modal-lg { max-width: 768px; }
-        
-        .modal-title { font-size: 1.8rem; font-weight: 900; margin-bottom: 2rem; display: flex; align-items: center; gap: 0.75rem; }
-        
+        .modal-content { background: var(--glass); border: 1px solid var(--border); border-radius: 3rem; padding: 2.5rem; width: 100%; max-height: 90vh; overflow-y: auto; box-shadow: 0 25px 50px rgba(0,0,0,0.25); transform: scale(0.95) translateY(10px); transition: 0.3s cubic-bezier(0.34,1.56,0.64,1); color: var(--text-main); }
+        .modal-overlay.active .modal-content { transform: scale(1) translateY(0); }
+        .modal-sm { max-width: 400px; } .modal-md { max-width: 500px; } .modal-lg { max-width: 768px; }
+        .modal-title { font-size: 1.8rem; font-weight: 900; margin-bottom: 1.5rem; display: flex; align-items: center; gap: 0.75rem; }
         .form-group { margin-bottom: 1.25rem; }
-        .form-label { display: flex; justify-content: space-between; font-size: 0.7rem; font-weight: 900; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; margin-left: 1rem; }
-        .form-input { width: 100%; padding: 1.25rem; border-radius: 1.5rem; border: 1px solid var(--border); background: var(--input-bg); color: var(--text-main); font-size: 0.85rem; outline: none; transition: 0.2s; }
-        .form-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.2); }
+        .form-label { display: flex; justify-content: space-between; font-size: 0.65rem; font-weight: 900; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; margin-left: 1rem; }
+        .form-input { width: 100%; padding: 1rem 1.25rem; border-radius: 1.5rem; border: 1px solid var(--border); background: var(--input-bg); color: var(--text-main); font-size: 0.85rem; outline: none; transition: 0.2s; }
+        .form-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(139,92,246,0.2); }
         .url-wrapper { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }
-        
         .progress-grid-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(32px, 1fr)); gap: 6px; max-height: 40vh; overflow-y: auto; padding-right: 0.5rem; margin-bottom: 1rem; }
         .progress-box { width: 32px; height: 32px; border-radius: 0.5rem; border: 2px solid var(--border); background: var(--input-bg); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s; color: transparent; }
         .progress-box:hover { border-color: var(--primary); transform: scale(1.1); }
         .progress-box.watched { background: var(--primary); border-color: var(--primary); color: white; }
-        .progress-box svg { width: 18px; height: 18px; }
-
-        .strike-item { background: var(--danger-bg); border: 1px solid rgba(239, 68, 68, 0.1); padding: 1.25rem; border-radius: 2rem; margin-bottom: 1rem; }
+        .strike-item { background: var(--danger-bg); border: 1px solid rgba(239,68,68,0.1); padding: 1.25rem; border-radius: 2rem; margin-bottom: 1rem; }
         .strike-date { font-size: 0.65rem; color: var(--danger); font-weight: 900; text-transform: uppercase; margin-bottom: 0.75rem; letter-spacing: 1px; }
-        .strike-video { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid rgba(0, 0, 0, 0.05); }
-        .dark .strike-video { border-bottom-color: rgba(255, 255, 255, 0.05); }
+        .strike-video { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid rgba(0,0,0,0.05); }
+        .dark .strike-video { border-bottom-color: rgba(255,255,255,0.05); }
         .strike-video:last-child { border-bottom: none; }
         .strike-video span { font-size: 0.75rem; font-weight: 800; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; flex: 1; margin-right: 1rem; }
-        
-        .animate-spin { animation: spin 1s linear infinite; }
+        .player-wrapper { display: none; max-width: 1200px; margin: 1.5rem auto 1rem auto; position: relative; overflow: hidden; }
+        .player-wrapper.active { display: block; }
+        .player-header { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1.5rem; background: rgba(0,0,0,0.85); color: white; border-radius: 1.5rem 1.5rem 0 0; border: 1px solid rgba(255,255,255,0.1); }
+        .player-header h3 { font-size: 0.9rem; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+        .player-video-wrap { position: relative; background: #000; overflow: hidden; }
+        .player-video-wrap video { width: 100%; display: block; max-height: 70vh; }
+        .player-yt-wrap { position: relative; padding-top: 56.25%; background: #000; }
+        .player-yt-wrap iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
+        .player-controls { display: flex; align-items: center; gap: 1rem; padding: 1rem 1.5rem; background: rgba(0,0,0,0.85); border-radius: 0 0 1.5rem 1.5rem; border: 1px solid rgba(255,255,255,0.1); border-top: none; flex-wrap: wrap; }
+        .player-progress { flex: 1; min-width: 120px; height: 6px; background: rgba(255,255,255,0.2); border-radius: 3px; cursor: pointer; position: relative; }
+        .player-progress-fill { height: 100%; background: var(--primary); border-radius: 3px; width: 0%; }
+        .player-time { color: rgba(255,255,255,0.7); font-size: 0.75rem; font-weight: 700; min-width: 45px; }
+        .player-btn { width: 36px; height: 36px; border-radius: 50%; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s; }
+        .player-btn:hover { background: rgba(255,255,255,0.2); }
+        .player-btn.large { width: 48px; height: 48px; }
+        .player-volume { display: flex; align-items: center; gap: 0.5rem; }
+        .player-volume input[type=range] { width: 80px; accent-color: var(--primary); }
+        .notes-panel { position: absolute; top: 0; right: -420px; width: 420px; height: 100%; background: var(--notes-bg); border-left: 1px solid var(--border); z-index: 50; transition: right 0.3s cubic-bezier(0.4,0,0.2,1); display: flex; flex-direction: column; box-shadow: -10px 0 40px rgba(0,0,0,0.3); }
+        .notes-panel.open { right: 0; }
+        .notes-header { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); }
+        .notes-header h3 { font-size: 1rem; font-weight: 900; }
+        .notes-body { flex: 1; overflow-y: auto; padding: 1.5rem; }
+        .notes-editor { width: 100%; height: 100%; min-height: 200px; background: transparent; border: none; color: var(--text-main); font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 0.85rem; line-height: 1.7; outline: none; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word; }
+        .notes-editor:empty::before { content: attr(data-placeholder); color: var(--text-muted); opacity: 0.5; }
+        .ts-link { color: var(--secondary); cursor: pointer; text-decoration: underline; text-underline-offset: 3px; font-weight: 700; border-radius: 0.25rem; padding: 0.1rem 0.2rem; transition: 0.15s; }
+        .ts-link:hover { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+        .notes-footer { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.5rem; border-top: 1px solid var(--border); flex-wrap: wrap; }
+        .notes-badge { font-size: 0.6rem; font-weight: 900; text-transform: uppercase; letter-spacing: 1px; padding: 0.3rem 0.75rem; border-radius: 1rem; background: var(--input-bg); color: var(--text-muted); }
+        .notes-badge.saved { color: var(--success); }
+        .fullscreen .navbar { display: none; }
+        .fullscreen .container { display: none; }
+        .fullscreen .player-wrapper { max-width: 100vw; margin: 0; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 9999; border-radius: 0; }
+        .fullscreen .player-header, .fullscreen .player-controls { display: none; }
+        .fullscreen .player-video-wrap { height: 100%; background: #000; }
+        .fullscreen .player-video-wrap video { max-height: 100vh; height: 100vh; object-fit: contain; }
         @keyframes spin { 100% { transform: rotate(360deg); } }
         @keyframes shake { 0%, 100% { transform: rotate(0deg); } 25% { transform: rotate(-6deg); } 75% { transform: rotate(6deg); } }
-        
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.3); border-radius: 10px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(139, 92, 246, 0.6); }
+        ::-webkit-scrollbar-thumb { background: rgba(139,92,246,0.3); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(139,92,246,0.6); }
+        .spell-menu { position: fixed; background: var(--glass); backdrop-filter: blur(20px); border: 1px solid var(--border); border-radius: 1rem; padding: 0.4rem 0; z-index: 99999; min-width: 170px; box-shadow: 0 10px 40px rgba(0,0,0,0.4); }
+        .spell-menu.hidden { display: none; }
+        .spell-menu-item { padding: 0.45rem 1rem; cursor: pointer; font-size: 0.8rem; color: var(--text-main); transition: 0.1s; }
+        .spell-menu-item:hover { background: var(--primary); color: white; }
+        .spell-menu-divider { height: 1px; background: var(--border); margin: 0.25rem 0.5rem; }
     </style>
 </head>
 <body>
 
-<nav class="navbar">
+<nav class="navbar" id="navbar">
     <div class="nav-left">
         <button id="mode-btn" onclick="toggleNetworkMode()" class="btn-mode">
-            <span id="mode-icon"></span>
-            <span id="mode-text">Offline</span>
+            <span id="mode-icon"></span><span id="mode-text">Offline</span>
         </button>
         <div onclick="pywebview.api.open_link('https://github.com/Glax3210')" style="display:flex;align-items:center;gap:0.75rem;cursor:pointer;font-weight:900;font-size:1.25rem;letter-spacing:-0.5px;">
-            <div style="width:36px;height:36px;background:var(--primary);border-radius:0.75rem;display:flex;align-items:center;justify-content:center;color:white;box-shadow:0 4px 10px rgba(139, 92, 246, 0.4);">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2l.5-.5m5.5-8.5l-2 2m-2-2l-2 2M21.5 2.5a15.92 15.92 0 00-6.5 2c-3.1 1.7-6.23 4.88-8 8-.5.83-.88 1.74-1 2.5l5.5 5.5c.76-.12 1.67-.5 2.5-1 3.12-1.77 6.3-4.9 8-8a15.92 15.92 0 002-6.5zM12 12a2 2 0 100-4 2 2 0 000 4z"/></svg>
-            </div>
-            <span class="hidden" style="display:block;">CourseTracker <span style="color:var(--primary)">Pro</span></span>
+            <div style="width:36px;height:36px;background:var(--primary);border-radius:0.75rem;display:flex;align-items:center;justify-content:center;color:white;box-shadow:0 4px 10px rgba(139,92,246,0.4);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2l.5-.5m5.5-8.5l-2 2m-2-2l-2 2M21.5 2.5a15.92 15.92 0 00-6.5 2c-3.1 1.7-6.23 4.88-8 8-.5.83-.88 1.74-1 2.5l5.5 5.5c.76-.12 1.67-.5 2.5-1 3.12-1.77 6.3-4.9 8-8a15.92 15.92 0 002-6.5zM12 12a2 2 0 100-4 2 2 0 000 4z"/></svg></div>
+            <span>CourseTracker <span style="color:var(--primary)">Pro</span></span>
         </div>
     </div>
     <div class="nav-right">
-        <button onclick="toggleTheme()" class="btn-icon">
+        <button onclick="showShortcuts()" class="btn-icon" title="Shortcuts (Shift+?)">?</button>
+        <button onclick="toggleTheme()" class="btn-icon" title="Theme (T)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
         </button>
     </div>
 </nav>
 
-<main class="container">
+<div class="player-wrapper" id="player-wrapper">
+    <div class="player-header">
+        <h3 id="player-title">No video loaded</h3>
+        <div style="display:flex;align-items:center;gap:0.75rem;">
+            <button onclick="takeScreenshot()" class="player-btn" title="Screenshot" style="width:28px;height:28px;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            </button>
+            <button onclick="closePlayer()" class="player-btn" title="Close (Esc)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;"><path d="M18 6L6 18M6 6l12 12"/></svg>
+            </button>
+        </div>
+    </div>
+    <div class="player-video-wrap" id="player-video-wrap">
+        <video id="player-video" style="display:none;" controlsList="nodownload" disablePictureInPicture></video>
+        <div class="player-yt-wrap" id="player-yt-wrap" style="display:none;"></div>
+    </div>
+    <div class="player-controls">
+        <button onclick="playerSeekRel(-10)" class="player-btn" title="Back 10s (Left arrow)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
+        </button>
+        <button onclick="playerToggle()" class="player-btn large" id="btn-player-play">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:24px;height:24px;"><polygon points="6 3 20 12 6 21 6 3" fill="currentColor"/></svg>
+        </button>
+        <button onclick="playerSeekRel(10)" class="player-btn" title="Forward 10s (Right arrow)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+        </button>
+        <span class="player-time" id="player-time-curr">0:00</span>
+        <div class="player-progress" id="player-progress-bar" onclick="playerClickSeek(event)">
+            <div class="player-progress-fill" id="player-progress-fill"></div>
+        </div>
+        <span class="player-time" id="player-time-total">0:00</span>
+        <div class="player-volume">
+            <button onclick="playerMute()" class="player-btn" title="Mute (M)" style="width:28px;height:28px;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 010 14.14M15.54 8.46a5 5 0 010 7.07"/></svg>
+            </button>
+            <input type="range" id="player-volume" min="0" max="100" value="80" oninput="playerSetVolume(this.value)" />
+        </div>
+    </div>
+    <div class="notes-panel" id="notes-panel">
+        <div class="notes-header">
+            <h3 id="notes-course-name">Notes</h3>
+            <div style="display:flex;align-items:center;gap:0.5rem;">
+                <span class="notes-badge" id="notes-timestamp">0:00</span>
+                <button onclick="insertTimestamp()" class="btn btn-xs btn-outline" style="border:1px solid var(--border);">TS</button>
+            </div>
+        </div>
+        <div class="notes-body">
+            <div contenteditable="true" spellcheck="true" class="notes-editor" id="notes-editor" data-placeholder="# Notes&#10;&#10;Start typing... Markdown supported.&#10;&#10;- **Bold** *italic* `code`&#10;- ## [HH:MM:SS] — click timestamps to seek&#10;- Press Ctrl+N to toggle"></div>
+        </div>
+        <div class="notes-footer">
+            <span class="notes-badge" id="notes-video-label">No video</span>
+            <span style="flex:1;"></span>
+            <button onclick="openNotesFolder()" class="btn btn-xs btn-outline">Open Folder</button>
+        </div>
+    </div>
+</div>
+
+<main class="container" id="main-container">
     <div id="course-grid" class="grid"></div>
 </main>
 
-<!-- ALL MODALS NOW USE DIV OVERLAYS -->
+<!-- MODALS -->
+<div id="modal-shortcuts" class="modal-overlay">
+    <div class="modal-content modal-md">
+        <h3 class="modal-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:28px;height:28px;color:var(--primary);"><path d="M15 7h3a5 5 0 015 5 5 5 0 01-5 5h-3m-6 0H6a5 5 0 01-5-5 5 5 0 015-5h3m4 4l-8 8"/></svg> Keyboard Shortcuts</h3>
+        <div id="shortcuts-content"></div>
+        <button onclick="closeModal('modal-shortcuts')" class="btn btn-outline w-full mt-4" style="background:var(--input-bg);">Close</button>
+    </div>
+</div>
+
 <div id="modal-confirm" class="modal-overlay">
     <div class="modal-content modal-sm text-center">
-        <div id="confirm-bg" style="width:80px;height:80px;border-radius:2rem;margin:0 auto 1.5rem;display:flex;align-items:center;justify-content:center;color:white;box-shadow:0 10px 20px rgba(0,0,0,0.1);">
-            <span id="confirm-icon" style="display:flex;"></span>
-        </div>
+        <div id="confirm-bg" style="width:80px;height:80px;border-radius:2rem;margin:0 auto 1.5rem;display:flex;align-items:center;justify-content:center;color:white;"><span id="confirm-icon"></span></div>
         <h3 id="confirm-title" class="modal-title justify-center" style="margin-bottom:0.5rem;">Confirm Action</h3>
         <p id="confirm-msg" class="text-muted" style="margin-bottom:2.5rem;line-height:1.6;font-size:0.9rem;"></p>
         <div class="flex-row">
@@ -568,13 +763,11 @@ HTML_TEMPLATE = r"""
     <div class="modal-content modal-md">
         <h3 id="modal-title" class="modal-title">Course Details</h3>
         <input type="hidden" id="c-id">
-        
         <div class="form-group">
             <label class="form-label">Name & Platform</label>
             <input id="c-name" type="text" placeholder="Course Name" class="form-input mb-2">
             <input id="c-plat" type="text" placeholder="Platform (e.g. Udemy/YouTube)" class="form-input">
         </div>
-        
         <div id="offline-fields" class="form-group">
             <label class="form-label">Source Folder</label>
             <div class="flex-row">
@@ -582,17 +775,17 @@ HTML_TEMPLATE = r"""
                 <button onclick="browseF()" class="btn btn-primary btn-small" style="padding:0 1.5rem;">Browse</button>
             </div>
         </div>
-
         <div id="online-fields" class="form-group hidden">
-            <label class="form-label">
-                <span>Playlist / Video URLs</span>
-                <span onclick="addUrlInput('')" style="color:var(--primary);cursor:pointer;display:flex;align-items:center;">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;"><path d="M12 5v14m-7-7h14"/></svg>
-                </span>
-            </label>
+            <label class="form-label"><span>Playlist / Video URLs</span><span onclick="addUrlInput('')" style="color:var(--primary);cursor:pointer;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;"><path d="M12 5v14m-7-7h14"/></svg></span></label>
             <div id="url-container" style="max-height:160px;overflow-y:auto;padding-right:0.5rem;"></div>
         </div>
-
+        <div class="form-group">
+            <label class="form-label">Notes Folder (where .md files save)</label>
+            <div class="flex-row">
+                <input id="c-notes-folder" readonly placeholder="Pick folder for notes..." class="form-input flex-1" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                <button onclick="browseNotesFolder()" class="btn btn-outline btn-small" style="padding:0 1.5rem;border:1px solid var(--border);">Browse</button>
+            </div>
+        </div>
         <div class="form-group">
             <label class="form-label">Custom Logo (Optional)</label>
             <div class="flex-row">
@@ -600,12 +793,10 @@ HTML_TEMPLATE = r"""
                 <button onclick="browseL()" class="btn btn-outline btn-small" style="padding:0 1.5rem;border:1px solid var(--border);">Image</button>
             </div>
         </div>
-        
         <div class="form-group">
             <label class="form-label">Daily Video Quota</label>
             <input id="c-quota" type="number" value="3" class="form-input">
         </div>
-        
         <div class="flex-row mt-4" style="padding-top:1rem;">
             <button onclick="closeModal('modal-course')" class="btn btn-outline flex-1">Cancel</button>
             <button id="btn-save-course" onclick="saveC()" class="btn btn-primary flex-1" style="flex:2;">Save Track</button>
@@ -615,11 +806,8 @@ HTML_TEMPLATE = r"""
 
 <div id="modal-strikes" class="modal-overlay">
     <div class="modal-content modal-md" style="display:flex;flex-direction:column;">
-        <h3 class="modal-title" style="color:var(--danger);">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:32px;height:32px;animation:shake 0.4s infinite;"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4m0 4h.01"/></svg>
-            Pending Strikes
-        </h3>
-        <div id="strikes-list" style="flex:1;overflow-y:auto;padding-right:0.5rem;max-height: 40vh;"></div>
+        <h3 class="modal-title" style="color:var(--danger);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:32px;height:32px;animation:shake 0.4s infinite;"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4m0 4h.01"/></svg> Pending Strikes</h3>
+        <div id="strikes-list" style="flex:1;overflow-y:auto;padding-right:0.5rem;max-height:40vh;"></div>
         <button onclick="closeModal('modal-strikes')" class="btn btn-outline w-full mt-4" style="background:var(--input-bg);">Got it</button>
     </div>
 </div>
@@ -627,14 +815,8 @@ HTML_TEMPLATE = r"""
 <div id="modal-progress" class="modal-overlay">
     <div class="modal-content modal-lg" style="display:flex;flex-direction:column;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2rem;">
-            <h3 class="modal-title" style="margin:0;">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--primary);width:32px;height:32px;"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>
-                Video Progress
-            </h3>
-            <button id="btn-reset-progress" class="btn btn-danger btn-small" style="display:flex;align-items:center;gap:0.5rem;background:transparent;color:var(--danger);border:1px solid var(--danger);">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;"><path d="M3 12a9 9 0 109-9 9.75 9.75 0 00-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-                Reset Progress
-            </button>
+            <h3 class="modal-title" style="margin:0;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--primary);width:32px;height:32px;"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg> Video Progress</h3>
+            <button id="btn-reset-progress" class="btn btn-danger btn-small" style="display:flex;align-items:center;gap:0.5rem;background:transparent;color:var(--danger);border:1px solid var(--danger);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;"><path d="M3 12a9 9 0 109-9 9.75 9.75 0 00-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg> Reset Progress</button>
         </div>
         <div id="progress-grid-container" class="progress-grid-container"></div>
         <button onclick="closeModal('modal-progress')" class="btn btn-outline w-full mt-4" style="background:var(--input-bg);">Close Grid</button>
@@ -654,417 +836,547 @@ HTML_TEMPLATE = r"""
         check: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" style="width:40px;height:40px;"><path d="M20 6L9 17l-5-5"/></svg>`,
         checkSmall: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg>`,
         close: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>`,
-        school: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:64px;height:64px;"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c3 3 9 3 12 0v-5"/></svg>`
+        school: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:64px;height:64px;"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c3 3 9 3 12 0v-5"/></svg>`,
+        play: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor"/></svg>`,
+        pauseIcon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16" rx="1" fill="currentColor"/><rect x="14" y="4" width="4" height="16" rx="1" fill="currentColor"/></svg>`
     };
 
-    let courses =[];
-    let confirmCb = null;
-    let appMode = 'offline';
+    let courses =[], confirmCb=null, appMode='offline', notesOpen=false, isFullscreen=false, notesFolder='';
+    let playerInfo={courseId:'',videoIndex:0,courseName:'',title:'',isYoutube:false,url:''};
 
-    document.getElementById('mode-icon').innerHTML = ICONS.wifiOff;
+    document.getElementById('mode-icon').innerHTML=ICONS.wifiOff;
 
-    // ==========================================
-    // BULLETPROOF DIV-BASED MODAL SYSTEM
-    // ==========================================
-    function openModal(id) {
-        // Only one primary modal can exist at once
-        if (id !== 'modal-confirm') {
-            document.querySelectorAll('.modal-overlay').forEach(m => {
-                if (m.id !== 'modal-confirm') m.classList.remove('active');
-            });
-        }
+    function openModal(id){
+        if(id!=='modal-confirm'){document.querySelectorAll('.modal-overlay').forEach(m=>{if(m.id!=='modal-confirm')m.classList.remove('active')});}
         document.getElementById(id).classList.add('active');
     }
-
-    function closeModal(id) {
-        document.getElementById(id).classList.remove('active');
-    }
-
-    // Close on background click (ignores confirm modal intentionally)
-    document.addEventListener("DOMContentLoaded", () => {
-        document.querySelectorAll('.modal-overlay').forEach(m => {
-            m.addEventListener('click', (e) => {
-                if (e.target === m && m.id !== 'modal-confirm') {
-                    closeModal(m.id);
-                }
-            });
+    function closeModal(id){document.getElementById(id).classList.remove('active');}
+    document.addEventListener("DOMContentLoaded",()=>{
+        document.querySelectorAll('.modal-overlay').forEach(m=>{
+            m.addEventListener('click',e=>{if(e.target===m&&m.id!=='modal-confirm')closeModal(m.id);});
         });
     });
 
-    function finishNetworkMode(mode, data) {
-        appMode = mode;
-        const btn = document.getElementById('mode-btn');
-        const icon = document.getElementById('mode-icon');
-        const text = document.getElementById('mode-text');
-
+    function finishNetworkMode(mode,data){
+        appMode=mode;
+        document.getElementById('mode-icon').innerHTML=appMode==='online'?ICONS.wifiOn:ICONS.wifiOff;
+        document.getElementById('mode-text').innerText=appMode==='online'?'Online':'Offline';
+        const btn=document.getElementById('mode-btn');
+        btn.className='btn-mode'+(appMode==='online'?' online':'');
         btn.classList.remove('disabled');
-        
-        if (appMode === 'online') {
-            icon.innerHTML = ICONS.wifiOn;
-            text.innerText = 'Online';
-            btn.className = 'btn-mode online';
-        } else {
-            icon.innerHTML = ICONS.wifiOff;
-            text.innerText = 'Offline';
-            btn.className = 'btn-mode';
-        }
-        
         render(data);
     }
-
-    function toggleNetworkMode() {
-        const targetMode = appMode === 'offline' ? 'online' : 'offline';
-        const btn = document.getElementById('mode-btn');
-        const icon = document.getElementById('mode-icon');
-        const text = document.getElementById('mode-text');
-        
-        if (btn.classList.contains('disabled')) return;
+    function toggleNetworkMode(){
+        const targetMode=appMode==='offline'?'online':'offline';
+        const btn=document.getElementById('mode-btn');
+        if(btn.classList.contains('disabled'))return;
         btn.classList.add('disabled');
-
-        icon.innerHTML = ICONS.sync;
-        text.innerText = 'Loading...';
-
-        pywebview.api.get_courses_async(targetMode, targetMode === 'online').catch(e => console.error(e));
+        document.getElementById('mode-icon').innerHTML=ICONS.sync;
+        document.getElementById('mode-text').innerText='Loading...';
+        pywebview.api.get_courses_async(targetMode,targetMode==='online').catch(e=>console.error(e));
     }
-
-    function openConfirm(title, msg, type, cb) {
-        // Automatically close itself before opening to prevent weird states
-        closeModal('modal-confirm'); 
-        
-        document.getElementById('confirm-title').innerText = title;
-        document.getElementById('confirm-msg').innerText = msg;
-        
-        const bg = document.getElementById('confirm-bg');
-        const btn = document.getElementById('confirm-btn');
-        const icon = document.getElementById('confirm-icon');
-        
-        if(type === 'danger') {
-            bg.style.background = 'var(--danger)';
-            bg.style.boxShadow = '0 10px 20px rgba(239, 68, 68, 0.3)';
-            btn.className = 'btn btn-danger flex-1';
-            icon.innerHTML = ICONS.warning;
-        } else {
-            bg.style.background = 'var(--primary)';
-            bg.style.boxShadow = '0 10px 20px rgba(139, 92, 246, 0.3)';
-            btn.className = 'btn btn-primary flex-1';
-            icon.innerHTML = ICONS.check;
-        }
-        confirmCb = cb;
-        openModal('modal-confirm');
-    }
-
-    function closeConfirm(res) {
+    function openConfirm(title,msg,type,cb){
         closeModal('modal-confirm');
-        const cb = confirmCb;
-        confirmCb = null; 
-        if(res && cb) cb();
+        document.getElementById('confirm-title').innerText=title;
+        document.getElementById('confirm-msg').innerText=msg;
+        const bg=document.getElementById('confirm-bg'),btn=document.getElementById('confirm-btn');
+        if(type==='danger'){bg.style.background='var(--danger)';btn.className='btn btn-danger flex-1';document.getElementById('confirm-icon').innerHTML=ICONS.warning;}
+        else{bg.style.background='var(--primary)';btn.className='btn btn-primary flex-1';document.getElementById('confirm-icon').innerHTML=ICONS.check;}
+        confirmCb=cb;openModal('modal-confirm');
     }
+    function closeConfirm(res){closeModal('modal-confirm');const cb=confirmCb;confirmCb=null;if(res&&cb)cb();}
+    function toggleTheme(){const h=document.documentElement;h.className=h.classList.contains('dark')?'light':'dark';pywebview.api.set_theme(h.className).catch(e=>console.error(e));}
+    function render(data){if(data)courses=data;renderGrid();}
 
-    function toggleTheme() {
-        const h = document.documentElement;
-        const t = h.classList.contains('dark') ? 'light' : 'dark';
-        h.className = t;
-        pywebview.api.set_theme(t).catch(e => console.error(e));
-    }
-
-    function render(data) {
-        if(data) courses = data;
-        renderGrid();
-    }
-
-    function renderGrid() {
-        const grid = document.getElementById('course-grid');
-        grid.innerHTML = `
-            <div onclick="openAdd()" class="card card-add">
-                <div class="card-add-icon">${ICONS.add}</div>
-                <p style="font-weight:900;color:var(--text-muted);">${appMode === 'online' ? 'New Online Track' : 'New Offline Track'}</p>
-            </div>
-        `;
-        
-        courses.forEach(c => {
-            const card = document.createElement('div');
-            card.className = "card";
-            
-            const strikeUI = c.strikes_count > 0 ? `
-                <button onclick="showStrikes('${c.id}')" class="strike-badge">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4m0 4h.01"/></svg>
-                    ${c.strikes_count}/5
-                </button>` : '';
-
-            card.innerHTML = `
-                ${strikeUI}
+    function renderGrid(){
+        const grid=document.getElementById('course-grid');
+        grid.innerHTML=`<div onclick="openAdd()" class="card card-add"><div class="card-add-icon">${ICONS.add}</div><p style="font-weight:900;color:var(--text-muted);">${appMode==='online'?'New Online Track':'New Offline Track'}</p></div>`;
+        courses.forEach(c=>{
+            const card=document.createElement('div');card.className="card";
+            const strikeUI=c.strikes_count>0?`<button onclick="showStrikes('${c.id}')" class="strike-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4m0 4h.01"/></svg> ${c.strikes_count}/5</button>`:'';
+            card.innerHTML=`${strikeUI}
                 <div class="card-actions">
                     <button onclick="openProgressGrid('${c.id}')" title="Grid" class="card-action-btn">${ICONS.grid}</button>
+                    <button onclick="openPlayer('${c.id}',${c.last_index})" title="Play in App" class="card-action-btn player">${ICONS.play}</button>
                     <button onclick="openEdit('${c.id}')" title="Edit" class="card-action-btn">${ICONS.edit}</button>
                     <button onclick="delC('${c.id}')" title="Delete" class="card-action-btn delete">${ICONS.delete}</button>
                 </div>
-                
-                <div class="card-img-wrapper">
-                    ${c.logo_b64 ? `<img src="${c.logo_b64}">` : `<div style="color:var(--text-muted);opacity:0.2;">${ICONS.school}</div>`}
-                    <div class="card-platform">${c.platform}</div>
+                <div class="card-img-wrapper">${c.logo_b64?`<img src="${c.logo_b64}">`:`<div style="color:var(--text-muted);opacity:0.2;">${ICONS.school}</div>`}<div class="card-platform">${c.platform}</div></div>
+                <div style="flex:1;display:flex;flex-direction:column;">
+                    <h3 class="card-title"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">${c.name}</span><button onclick="toggleS('${c.id}')" class="status-dot ${c.status==='active'?'status-active':'status-paused'}" title="Toggle Pause"></button></h3>
+                    <div class="progress-info"><span>Total Progress</span><span>${c.progress}%</span></div>
+                    <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${c.progress}%"></div></div>
                 </div>
-
-                <div style="flex:1; display:flex; flex-direction:column;">
-                    <h3 class="card-title">
-                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;">${c.name}</span>
-                        <button onclick="toggleS('${c.id}')" class="status-dot ${c.status==='active'?'status-active':'status-paused'}" title="Toggle Pause"></button>
-                    </h3>
-                    
-                    <div class="progress-info">
-                        <span>Total Progress</span>
-                        <span>${c.progress}%</span>
-                    </div>
-                    <div class="progress-bar-bg">
-                        <div class="progress-bar-fill" style="width:${c.progress}%"></div>
-                    </div>
-                </div>
-
                 <div class="quota-box ${c.is_quota_met?'quota-met':''}">
-                    <div class="quota-info">
-                        <span>Daily Quota</span>
-                        <span style="color:${c.is_quota_met?'var(--success)':'var(--text-main)'}">${c.watched_today_count} / ${c.daily_quota}</span>
-                    </div>
-                    <button onclick="playNext('${c.id}', this)" class="btn btn-primary w-full" style="padding:1rem;">
-                        ${c.is_quota_met ? 'DAILY GOAL MET' : 'PLAY NEXT LESSON'}
-                    </button>
-                </div>
-            `;
+                    <div class="quota-info"><span>Daily Quota</span><span style="color:${c.is_quota_met?'var(--success)':'var(--text-main)'}">${c.watched_today_count}/${c.daily_quota}</span></div>
+                    <button onclick="playNext('${c.id}',this)" class="btn btn-primary w-full" style="padding:1rem;">${c.is_quota_met?'DAILY GOAL MET':'PLAY NEXT LESSON'}</button>
+                </div>`;
             grid.appendChild(card);
         });
     }
 
-    function setupModeFields(type) {
-        if(type === 'online') {
-            document.getElementById('offline-fields').classList.add('hidden');
-            document.getElementById('online-fields').classList.remove('hidden');
-            document.getElementById('c-name').placeholder = "Course Name (Leave blank to auto-fetch)";
-        } else {
-            document.getElementById('offline-fields').classList.remove('hidden');
-            document.getElementById('online-fields').classList.add('hidden');
-            document.getElementById('c-name').placeholder = "Course Name";
-        }
+    function setupModeFields(type){
+        if(type==='online'){document.getElementById('offline-fields').classList.add('hidden');document.getElementById('online-fields').classList.remove('hidden');document.getElementById('c-name').placeholder="Course Name (leave blank to auto-fetch)";}
+        else{document.getElementById('offline-fields').classList.remove('hidden');document.getElementById('online-fields').classList.add('hidden');document.getElementById('c-name').placeholder="Course Name";}
     }
-
-    function removeUrlInput(btn) { btn.parentElement.remove(); }
-    
-    function addUrlInput(val = '') {
-        const div = document.createElement('div');
-        div.className = "url-wrapper";
-        div.innerHTML = `
-            <input type="text" value="${val}" placeholder="https://..." class="form-input flex-1 url-input" style="padding:1rem;">
-            <button onclick="removeUrlInput(this)" class="btn-icon" style="color:var(--danger);border-color:var(--danger);border-radius:1rem;">${ICONS.close}</button>
-        `;
+    function removeUrlInput(btn){btn.parentElement.remove();}
+    function addUrlInput(val=''){
+        const div=document.createElement('div');div.className="url-wrapper";
+        div.innerHTML=`<input type="text" value="${val}" placeholder="https://..." class="form-input flex-1 url-input" style="padding:1rem;"><button onclick="removeUrlInput(this)" class="btn-icon" style="color:var(--danger);border-color:var(--danger);border-radius:1rem;">${ICONS.close}</button>`;
         document.getElementById('url-container').appendChild(div);
     }
-
-    function openAdd() {
-        document.getElementById('modal-title').innerHTML = appMode === 'online' ? `${ICONS.add} Create Online Track` : `${ICONS.add} Create Track`;
-        document.getElementById('c-id').value = "";
-        document.getElementById('c-name').value = "";
-        document.getElementById('c-plat').value = "";
-        document.getElementById('c-folder').value = "";
-        document.getElementById('c-logo').value = "";
-        document.getElementById('c-quota').value = 3;
-        
-        setupModeFields(appMode);
-        document.getElementById('url-container').innerHTML = '';
-        if(appMode === 'online') addUrlInput('');
-        
+    function openAdd(){
+        document.getElementById('modal-title').innerHTML=`${ICONS.add} Create Track`;
+        document.getElementById('c-id').value="";document.getElementById('c-name').value="";document.getElementById('c-plat').value="";
+        document.getElementById('c-folder').value="";document.getElementById('c-logo').value="";
+        document.getElementById('c-notes-folder').value=notesFolder||"";document.getElementById('c-quota').value=3;
+        setupModeFields(appMode);document.getElementById('url-container').innerHTML='';
+        if(appMode==='online')addUrlInput('');openModal('modal-course');
+    }
+    function openEdit(id){
+        const c=courses.find(x=>x.id===id);const type=c.type||'offline';
+        document.getElementById('modal-title').innerHTML=`${ICONS.edit} Edit Track`;
+        document.getElementById('c-id').value=c.id;document.getElementById('c-name').value=c.name;document.getElementById('c-plat').value=c.platform;
+        document.getElementById('c-folder').value=c.folder||"";document.getElementById('c-logo').value=c.logo||"";
+        document.getElementById('c-notes-folder').value=c.notes_folder||notesFolder||"";document.getElementById('c-quota').value=c.daily_quota;
+        setupModeFields(type);document.getElementById('url-container').innerHTML='';
+        if(type==='online'){if(c.urls&&c.urls.length)c.urls.forEach(u=>addUrlInput(u));else addUrlInput('');}
         openModal('modal-course');
     }
-
-    function openEdit(id) {
-        const c = courses.find(x => x.id === id);
-        const type = c.type || 'offline';
-        document.getElementById('modal-title').innerHTML = `${ICONS.edit} Edit Track`;
-        document.getElementById('c-id').value = c.id;
-        document.getElementById('c-name').value = c.name;
-        document.getElementById('c-plat').value = c.platform;
-        document.getElementById('c-folder').value = c.folder || "";
-        document.getElementById('c-logo').value = c.logo || "";
-        document.getElementById('c-quota').value = c.daily_quota;
-        
-        setupModeFields(type);
-        document.getElementById('url-container').innerHTML = '';
-        if(type === 'online') {
-            if(c.urls && c.urls.length) c.urls.forEach(u => addUrlInput(u));
-            else addUrlInput('');
+    function openProgressGrid(id){
+        const c=courses.find(x=>x.id===id);const container=document.getElementById('progress-grid-container');container.innerHTML='';
+        document.getElementById('btn-reset-progress').onclick=()=>resetCourseProgress(id);
+        for(let i=0;i<c.total_videos;i++){
+            const box=document.createElement('div'),isChecked=i<c.last_index;
+            box.className="progress-box"+(isChecked?" watched":"");box.title=`Play Video ${i+1}`;
+            box.onclick=()=>openPlayer(id,i);if(isChecked)box.innerHTML=ICONS.checkSmall;container.appendChild(box);
         }
-        openModal('modal-course');
-    }
-
-    function openProgressGrid(id) {
-        const c = courses.find(x => x.id === id);
-        const container = document.getElementById('progress-grid-container');
-        container.innerHTML = '';
-        
-        const btnReset = document.getElementById('btn-reset-progress');
-        btnReset.onclick = () => resetCourseProgress(id);
-        
-        for (let i = 0; i < c.total_videos; i++) {
-            const box = document.createElement('div');
-            const isChecked = i < c.last_index;
-            
-            box.className = "progress-box" + (isChecked ? " watched" : "");
-            box.title = `Play Video ${i + 1}`;
-            box.onclick = () => pywebview.api.play_specific(id, i).catch(e => console.error(e));
-            
-            if (isChecked) box.innerHTML = ICONS.checkSmall;
-            container.appendChild(box);
-        }
-        
-        if(c.total_videos === 0) {
-            container.innerHTML = `<p style="grid-column:1/-1;text-align:center;color:var(--text-muted);font-weight:bold;padding:2rem 0;">No videos tracked for this course.</p>`;
-        }
+        if(c.total_videos===0)container.innerHTML=`<p style="grid-column:1/-1;text-align:center;color:var(--text-muted);font-weight:bold;padding:2rem 0;">No videos tracked.</p>`;
         openModal('modal-progress');
     }
-    
-    function resetCourseProgress(id) {
-        openConfirm("Reset Progress?", "This will wipe all watched history, clear strikes, and start this track from 0%. Are you sure?", "danger", () => {
-            pywebview.api.reset_progress(id, appMode).then(data => {
-                render(data);
-                openProgressGrid(id); 
-            }).catch(e => console.error(e));
+    function resetCourseProgress(id){
+        openConfirm("Reset Progress?","This wipes history, clears strikes, starts from 0%.","danger",()=>{
+            pywebview.api.reset_progress(id,appMode).then(data=>{render(data);openProgressGrid(id);}).catch(e=>console.error(e));
         });
     }
-
-    function saveC() {
-        const btn = document.getElementById('btn-save-course');
-        
-        // Prevent multiple clicks
-        if (btn.disabled) return;
-        btn.disabled = true;
-        btn.innerHTML = `<span style="display:flex;align-items:center;justify-content:center;gap:0.5rem;">${ICONS.sync} Saving...</span>`;
-
-        const i = document.getElementById('c-id').value;
-        const n = document.getElementById('c-name').value;
-        const p = document.getElementById('c-plat').value;
-        const f = document.getElementById('c-folder').value;
-        const q = document.getElementById('c-quota').value;
-        const l = document.getElementById('c-logo').value;
-        
-        const isOnline = !document.getElementById('online-fields').classList.contains('hidden');
-        let urls =[];
-        if(isOnline) {
-            urls = Array.from(document.querySelectorAll('.url-input')).map(el => el.value).filter(v => v.trim() !== '');
-            if(urls.length === 0) {
-                btn.innerHTML = `Save Track`;
-                btn.disabled = false;
-                return;
-            }
-        } else {
-            if(!n || !f) {
-                btn.innerHTML = `Save Track`;
-                btn.disabled = false;
-                return;
-            }
-        }
-
-        const type = isOnline ? 'online' : 'offline';
-
-        const req = i ? pywebview.api.update_c(i,n,p,f,q,l,type,urls, appMode) : pywebview.api.add_c(n,p,f,q,l,type,urls, appMode);
-        req.then(data => {
-            render(data);
-            btn.innerHTML = `Save Track`;
-            btn.disabled = false;
-            closeModal('modal-course');
-        }).catch(e => {
-            console.error(e);
-            btn.innerHTML = `Save Track`;
-            btn.disabled = false;
-        });
+    function saveC(){
+        const btn=document.getElementById('btn-save-course');if(btn.disabled)return;btn.disabled=true;
+        btn.innerHTML=`<span style="display:flex;align-items:center;justify-content:center;gap:0.5rem;">${ICONS.sync} Saving...</span>`;
+        const i=document.getElementById('c-id').value,n=document.getElementById('c-name').value,p=document.getElementById('c-plat').value;
+        const f=document.getElementById('c-folder').value,q=document.getElementById('c-quota').value,l=document.getElementById('c-logo').value;
+        const nf=document.getElementById('c-notes-folder').value;
+        const isOnline=!document.getElementById('online-fields').classList.contains('hidden');let urls=[];
+        if(isOnline){urls=Array.from(document.querySelectorAll('.url-input')).map(el=>el.value).filter(v=>v.trim()!=='');if(urls.length===0){btn.disabled=false;btn.innerHTML='Save Track';return;}}
+        else{if(!n||!f){btn.disabled=false;btn.innerHTML='Save Track';return;}}
+        if(nf){notesFolder=nf;pywebview.api.notes_set_folder(nf).catch(()=>{});}
+        const type=isOnline?'online':'offline';
+        const req=i?pywebview.api.update_c(i,n,p,f,q,l,type,urls,nf,appMode):pywebview.api.add_c(n,p,f,q,l,type,urls,nf,appMode);
+        req.then(data=>{render(data);btn.disabled=false;btn.innerHTML='Save Track';closeModal('modal-course');}).catch(e=>{console.error(e);btn.disabled=false;btn.innerHTML='Save Track';});
     }
-
-    function playNext(id, btnElement) {
-        const c = courses.find(x => x.id === id);
-        if(c.is_quota_met) return;
-        
-        if (btnElement.disabled) return;
-        btnElement.disabled = true;
-        
-        const originalHTML = btnElement.innerHTML;
-        btnElement.innerHTML = `LAUNCHING...`;
-
-        pywebview.api.play(id).then(ok => {
-            btnElement.innerHTML = originalHTML;
-            btnElement.disabled = false;
-            if(ok) {
-                openConfirm("Lesson Launched", "Did you complete the full lesson? This updates your daily count.", "success", () => {
-                    pywebview.api.mark(id, appMode).then(render).catch(e => console.error(e));
-                });
-            }
-        }).catch(e => {
-            console.error(e);
-            btnElement.innerHTML = originalHTML;
-            btnElement.disabled = false;
-        });
+    function playNext(id,btnElement){
+        const c=courses.find(x=>x.id===id);if(c.is_quota_met)return;if(btnElement.disabled)return;btnElement.disabled=true;
+        btnElement.innerHTML='LAUNCHING...';
+        openPlayer(id,c.last_index);
+        btnElement.innerHTML='PLAY NEXT LESSON';btnElement.disabled=false;
     }
-
-    function showStrikes(id) {
-        const c = courses.find(x => x.id === id);
-        const list = document.getElementById('strikes-list');
-        list.innerHTML = "";
-        c.strikes_data.forEach(s => {
-            const wrap = document.createElement('div');
-            wrap.className = "strike-item";
-            let vids = "";
-            s.videos.forEach(v => {
-                const name = v.startsWith('http') ? (v.split('v=')[1] || "Online Video") : v.split(/[\\/]/).pop();
-                vids += `<div class="strike-video">
-                    <span title="${name}">${name}</span>
-                    <button onclick="playS('${id}', '${s.id}', '${v.replace(/\\/g,'\\\\')}', this)" class="btn btn-danger btn-small" style="font-weight:900;">RESOLVE</button>
-                </div>`;
-            });
-            wrap.innerHTML = `<div class="strike-date">Missed Day: ${s.date}</div>${vids}`;
-            list.appendChild(wrap);
-        });
+    function showStrikes(id){
+        const c=courses.find(x=>x.id===id),list=document.getElementById('strikes-list');list.innerHTML="";
+        c.strikes_data.forEach(s=>{const wrap=document.createElement('div');wrap.className="strike-item";let vids="";
+            s.videos.forEach(v=>{const name=v.startsWith('http')?(v.split('v=')[1]||"Online Video"):v.split(/[\\/]/).pop();
+                vids+=`<div class="strike-video"><span title="${name}">${name}</span><button onclick="playS('${id}','${s.id}','${v.replace(/\\/g,'\\\\')}',this)" class="btn btn-danger btn-small" style="font-weight:900;">RESOLVE</button></div>`;});
+            wrap.innerHTML=`<div class="strike-date">Missed Day: ${s.date}</div>${vids}`;list.appendChild(wrap);});
         openModal('modal-strikes');
     }
+    function playS(i,si,fn,btnElement){
+        if(btnElement.disabled)return;btnElement.disabled=true;const orig=btnElement.innerHTML;btnElement.innerHTML='...';
+        pywebview.api.play_strike(i,fn).then(ok=>{btnElement.innerHTML=orig;btnElement.disabled=false;
+            if(ok)openConfirm("Resolution","Lesson finished?","success",()=>{pywebview.api.resolve(i,si,fn,appMode).then(data=>{render(data);
+                const updated=data.find(x=>x.id===i);if(!updated||updated.strikes_count===0)closeModal('modal-strikes');else showStrikes(i);
+            }).catch(e=>console.error(e));});
+        }).catch(e=>{console.error(e);btnElement.innerHTML=orig;btnElement.disabled=false;});
+    }
+    function delC(id){openConfirm("Delete Track?","This permanently deletes this course and history.","danger",()=>pywebview.api.delete_c(id,appMode).then(render).catch(e=>console.error(e)));}
+    function toggleS(id){pywebview.api.toggle_c(id,appMode).then(render).catch(e=>console.error(e));}
+    function browseF(){pywebview.api.browse_f().then(p=>{if(p)document.getElementById('c-folder').value=p;}).catch(e=>console.error(e));}
+    function browseL(){pywebview.api.browse_l().then(p=>{if(p)document.getElementById('c-logo').value=p;}).catch(e=>console.error(e));}
+    function browseNotesFolder(){pywebview.api.browse_notes_folder().then(p=>{if(p)document.getElementById('c-notes-folder').value=p;}).catch(e=>console.error(e));}
 
-    function playS(i, si, fn, btnElement) {
-        if (btnElement.disabled) return;
-        btnElement.disabled = true;
-        const originalHTML = btnElement.innerHTML;
-        btnElement.innerHTML = `...`;
+    // ========== HTML5 PLAYER ==========
+    const videoEl=document.getElementById('player-video'),ytWrap=document.getElementById('player-yt-wrap'),playBtn=document.getElementById('btn-player-play');
+    videoEl.addEventListener('timeupdate',()=>{updatePlayerTime();});
+    videoEl.addEventListener('loadedmetadata',()=>{document.getElementById('player-time-total').innerText=fmtTime(videoEl.duration);});
+    videoEl.addEventListener('play',()=>{playBtn.innerHTML=ICONS.pauseIcon;});
+    videoEl.addEventListener('pause',()=>{playBtn.innerHTML=ICONS.play;});
+    videoEl.addEventListener('ended',()=>{
+        playBtn.innerHTML=ICONS.play;
+        if(playerInfo.courseId){
+            openConfirm("Video Complete","Did you complete the full lesson? This updates your daily count.","success",()=>{
+                pywebview.api.mark(playerInfo.courseId,appMode).then(render).catch(e=>console.error(e));
+            });
+        }
+    });
+    videoEl.addEventListener('error',()=>{document.getElementById('player-title').innerText='Error: cannot play this file. Try a different format.';});
 
-        pywebview.api.play_strike(i, fn).then((ok) => {
-            btnElement.innerHTML = originalHTML;
-            btnElement.disabled = false;
-            
-            if (ok) {
-                openConfirm("Resolution", "Lesson finished? This clears the strike.", "success", () => {
-                    pywebview.api.resolve(i, si, fn, appMode).then(data => {
-                        render(data);
-                        const updated = data.find(x => x.id === i);
-                        if(!updated || updated.strikes_count === 0) closeModal('modal-strikes');
-                        else showStrikes(i);
-                    }).catch(e => console.error(e));
-                });
+    function openPlayer(courseId,videoIndex){
+        const c=courses.find(x=>x.id===courseId);if(!c)return;
+        playerInfo.courseId=courseId;playerInfo.videoIndex=videoIndex;playerInfo.courseName=c.name||'';
+        if(c.notes_folder&&!notesFolder){notesFolder=c.notes_folder;pywebview.api.notes_set_folder(c.notes_folder).catch(()=>{});}
+        loadNotesForCurrentVideo();
+        document.getElementById('player-title').innerText='Loading...';
+        document.getElementById('player-wrapper').classList.add('active');
+        document.getElementById('player-wrapper').scrollIntoView({behavior:'smooth'});
+        pywebview.api.player_get_video(courseId,videoIndex).then(res=>{
+            if(!res.ok){document.getElementById('player-title').innerText=res.error;return;}
+            playerInfo.title=res.title||'';playerInfo.isYoutube=res.is_youtube||false;playerInfo.url=res.url||'';
+            document.getElementById('player-title').innerText=playerInfo.title||playerInfo.url;
+            document.getElementById('notes-video-label').innerText=playerInfo.title||'Video playing';
+            document.getElementById('notes-course-name').innerText=playerInfo.courseName;
+            if(playerInfo.isYoutube){
+                videoEl.style.display='none';videoEl.pause();ytWrap.style.display='block';
+                const vidId=getYoutubeId(playerInfo.url);
+                ytWrap.innerHTML=`<iframe src="https://www.youtube-nocookie.com/embed/${vidId}?autoplay=1&enablejsapi=1&origin=http://localhost&rel=0" allow="autoplay;encrypted-media;picture-in-picture;fullscreen" allowfullscreen></iframe>`;
+                playBtn.innerHTML=ICONS.pauseIcon;
+            }else{
+                ytWrap.style.display='none';ytWrap.innerHTML='';videoEl.style.display='block';
+                videoEl.src=playerInfo.url;videoEl.play().catch(()=>{});playBtn.innerHTML=ICONS.pauseIcon;
             }
-        }).catch(e => {
-            console.error(e);
-            btnElement.innerHTML = originalHTML;
-            btnElement.disabled = false;
-        });
+            loadNotesForCurrentVideo();
+        }).catch(e=>console.error(e));
+    }
+    function getYoutubeId(url){
+        let m=url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([\w-]{11})/);
+        if(m)return m[1];
+        m=url.match(/(?:v=|iy\/)([\w-]{11})(?:&|$|%|#|\?)/);
+        return m?m[1]:url;
+    }
+    function closePlayer(){
+        videoEl.pause();videoEl.src='';videoEl.style.display='none';ytWrap.innerHTML='';ytWrap.style.display='none';
+        document.getElementById('player-wrapper').classList.remove('active');playBtn.innerHTML=ICONS.play;
+        if(notesOpen){notesOpen=false;document.getElementById('notes-panel').classList.remove('open');}
+        playerInfo={courseId:'',videoIndex:0,courseName:'',title:'',isYoutube:false,url:''};
+    }
+    function playerToggle(){
+        if(playerInfo.isYoutube){const iframe=ytWrap.querySelector('iframe');if(iframe){
+            if(playBtn.innerHTML.includes('pauseIcon')||playBtn.innerHTML.includes('rect')){iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}','*');playBtn.innerHTML=ICONS.play;}
+            else{iframe.contentWindow.postMessage('{"event":"command","func":"playVideo","args":""}','*');playBtn.innerHTML=ICONS.pauseIcon;}
+        }}else if(videoEl.src){if(videoEl.paused)videoEl.play().catch(()=>{});else videoEl.pause();}
+    }
+    function playerSeekRel(sec){if(!playerInfo.isYoutube)videoEl.currentTime=Math.max(0,videoEl.currentTime+sec);}
+    function playerClickSeek(e){if(playerInfo.isYoutube)return;const bar=document.getElementById('player-progress-bar');videoEl.currentTime=((e.clientX-bar.getBoundingClientRect().left)/bar.offsetWidth)*videoEl.duration;}
+    function playerSetVolume(val){videoEl.volume=val/100;}
+    function playerMute(){videoEl.muted=!videoEl.muted;}
+    function updatePlayerTime(){
+        const t=videoEl.currentTime,d=videoEl.duration;
+        document.getElementById('player-time-curr').innerText=fmtTime(t);
+        if(d)document.getElementById('player-progress-fill').style.width=((t/d)*100)+'%';
+        document.getElementById('notes-timestamp').innerText=fmtTime(t);
+    }
+    function fmtTime(sec){if(!sec||isNaN(sec)||sec<0)return'0:00';const m=Math.floor(sec/60),s=Math.floor(sec%60);return m+':'+(s<10?'0':'')+s;}
+
+    function takeScreenshot(){
+        if(!playerInfo.isYoutube&&videoEl.src&&videoEl.videoWidth>0){try{
+            const canvas=document.createElement('canvas');canvas.width=videoEl.videoWidth;canvas.height=videoEl.videoHeight;
+            canvas.getContext('2d').drawImage(videoEl,0,0);
+            pywebview.api.notes_save_image(playerInfo.courseName,playerInfo.title||'screenshot',canvas.toDataURL('image/png')).then(res=>{if(res.path)showSavedToast('Screenshot saved!');}).catch(()=>{});
+        }catch(e){console.error(e);}}else showSavedToast('Screenshots only for local videos');
     }
 
-    function delC(id) { openConfirm("Delete Track?", "This permanently deletes this course and history.", "danger", () => pywebview.api.delete_c(id, appMode).then(render).catch(e => console.error(e))); }
-    function toggleS(id) { pywebview.api.toggle_c(id, appMode).then(render).catch(e => console.error(e)); }
-    function browseF() { pywebview.api.browse_f().then(p => { if(p) document.getElementById('c-folder').value = p; }).catch(e => console.error(e)); }
-    function browseL() { pywebview.api.browse_l().then(p => { if(p) document.getElementById('c-logo').value = p; }).catch(e => console.error(e)); }
+    // ========== NOTES PANEL (contenteditable with clickable timestamps) ==========
+    const notesEditor = document.getElementById('notes-editor');
+    let lastParsedHTML = '', lastParsedText = '';
 
-    window.addEventListener('pywebviewready', () => {
-        pywebview.api.get_courses_sync('offline').then(render).catch(e => console.error(e));
+    function parseAndHighlightTimestamps() {
+        const text = notesEditor.innerText;
+        if (text === lastParsedText) return;
+        lastParsedText = text;
+        let html = text.replace(/\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g, '<span class="ts-link" data-seek="$1">[$1]</span>');
+        if (html === lastParsedHTML) return;
+        lastParsedHTML = html;
+        const sel = window.getSelection();
+        let offset = 0;
+        if (sel.rangeCount && notesEditor.contains(sel.anchorNode)) {
+            const pre = document.createRange();
+            pre.selectNodeContents(notesEditor);
+            pre.setEnd(sel.anchorNode, sel.anchorOffset);
+            offset = pre.toString().length;
+        }
+        notesEditor.innerHTML = html;
+        setCursorOffset(notesEditor, offset);
+    }
+
+    function setCursorOffset(el, target) {
+        const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+        let node, count = 0;
+        while ((node = walk.nextNode())) {
+            const len = node.textContent.length;
+            if (count + len >= target) {
+                const r = document.createRange();
+                r.setStart(node, target - count);
+                r.collapse(true);
+                const s = window.getSelection();
+                s.removeAllRanges();
+                s.addRange(r);
+                return;
+            }
+            count += len;
+        }
+    }
+
+    notesEditor.addEventListener('blur', () => {
+        if (notesEditor.innerText !== lastParsedText) parseAndHighlightTimestamps();
+    });
+
+    notesEditor.addEventListener('click', (e) => {
+        const link = e.target.closest('.ts-link');
+        if (link && videoEl.src) {
+            e.preventDefault();
+            const parts = link.dataset.seek.split(':');
+            let s = 0;
+            if (parts.length === 3) s = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseInt(parts[2]);
+            else s = parseInt(parts[0]) * 60 + parseInt(parts[1]);
+            videoEl.currentTime = s;
+            if (videoEl.paused) videoEl.play().catch(() => {});
+        }
+    });
+
+    notesEditor.addEventListener('contextmenu', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var m = document.getElementById('spell-menu');
+        var word = getCursorWord();
+        m.innerHTML = '<div class="spell-menu-item" style="opacity:0.6;">Loading...</div>';
+        m.style.left = e.clientX + 'px';
+        m.style.top = e.clientY + 'px';
+        m.classList.remove('hidden');
+        function buildMenu(sugs) {
+            var html = '';
+            if (sugs && sugs.length > 0) {
+                html += '<div class="spell-menu-item" style="font-size:0.6rem;color:var(--text-muted);text-transform:uppercase;font-weight:900;letter-spacing:1px;cursor:default;" onmouseover="this.style.background=\'transparent\';this.style.color=\'var(--text-muted)\';">Spelling Suggestions</div>';
+                sugs.forEach(function(s) {
+                    html += '<div class="spell-menu-item" style="color:var(--secondary);font-weight:700;" onclick="replaceCursorWord(\'' + s + '\');document.getElementById(\'spell-menu\').classList.add(\'hidden\');">' + s + '</div>';
+                });
+                html += '<div class="spell-menu-divider"></div>';
+            }
+            html += '<div class="spell-menu-item" onclick="document.execCommand(\'cut\');document.getElementById(\'spell-menu\').classList.add(\'hidden\');">Cut</div>';
+            html += '<div class="spell-menu-item" onclick="document.execCommand(\'copy\');document.getElementById(\'spell-menu\').classList.add(\'hidden\');">Copy</div>';
+            html += '<div class="spell-menu-item" onclick="document.execCommand(\'paste\');document.getElementById(\'spell-menu\').classList.add(\'hidden\');">Paste</div>';
+            html += '<div class="spell-menu-divider"></div>';
+            html += '<div class="spell-menu-item" onclick="document.execCommand(\'selectAll\');document.getElementById(\'spell-menu\').classList.add(\'hidden\');">Select All</div>';
+            m.innerHTML = html;
+        }
+        var known = true;
+        try {
+            pywebview.api.spell_check(word).then(function(res) {
+                buildMenu(res.suggestions);
+            }).catch(function() { buildMenu([]); });
+        } catch(ex) { buildMenu([]); }
+        setTimeout(function() { if (m.innerHTML.indexOf('Loading') >= 0) buildMenu([]); }, 2000);
+    });
+
+    function getCursorWord() {
+        var sel = window.getSelection();
+        if (!sel.rangeCount) return '';
+        var node = sel.anchorNode;
+        if (!node || node.nodeType !== 3) return '';
+        var text = node.textContent;
+        var offset = sel.anchorOffset;
+        var start = offset;
+        while (start > 0 && /\w/.test(text[start-1])) start--;
+        var end = offset;
+        while (end < text.length && /\w/.test(text[end])) end++;
+        return text.slice(start, end);
+    }
+
+    function replaceCursorWord(newWord) {
+        var sel = window.getSelection();
+        if (!sel.rangeCount) return;
+        var node = sel.anchorNode;
+        if (!node || node.nodeType !== 3) return;
+        var text = node.textContent;
+        var offset = sel.anchorOffset;
+        var start = offset;
+        while (start > 0 && /\w/.test(text[start-1])) start--;
+        var end = offset;
+        while (end < text.length && /\w/.test(text[end])) end++;
+        var r = document.createRange();
+        r.setStart(node, start);
+        r.setEnd(node, end);
+        r.deleteContents();
+        r.insertNode(document.createTextNode(newWord));
+        r.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(r);
+        notesEditor.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    document.addEventListener('click', function(e) {
+        var m = document.getElementById('spell-menu');
+        if (!m.contains(e.target)) m.classList.add('hidden');
+    });
+
+    function toggleNotesPanel() {
+        notesOpen = !notesOpen;
+        if (notesOpen) {
+            document.getElementById('notes-panel').classList.add('open');
+            parseAndHighlightTimestamps();
+        } else {
+            document.getElementById('notes-panel').classList.remove('open');
+        }
+    }
+    document.getElementById('notes-panel').addEventListener('transitionend', function(e) {
+        if (notesOpen && e.propertyName === 'right') notesEditor.focus();
+    });
+    function openNotesFolder() { if (notesFolder) pywebview.api.open_link(notesFolder).catch(() => {}); }
+
+    function loadNotesForCurrentVideo() {
+        if (!notesFolder || !playerInfo.courseName) return;
+        pywebview.api.notes_load(playerInfo.courseName, playerInfo.title, playerInfo.videoIndex).then(res => {
+            notesEditor.innerText = res.content || '';
+            lastParsedHTML = ''; lastParsedText = '';
+            lastSavedContent = res.content || '';
+            parseAndHighlightTimestamps();
+        }).catch(() => { notesEditor.innerText = ''; lastSavedContent = ''; });
+    }
+
+    function saveNotes() {
+        if (!playerInfo.courseName) { alert('Load a video first to save notes.'); return; }
+        if (!notesFolder) { alert('Set a notes folder in the course settings first.'); return; }
+        pywebview.api.notes_save(playerInfo.courseName, playerInfo.title, playerInfo.videoIndex, notesEditor.innerText, playerInfo.isYoutube, playerInfo.url).then(res => { if (res.success) showSavedToast('Notes saved!'); }).catch(e => console.error(e));
+    }
+
+    var autoSaveTimer = null, lastSavedContent = '';
+    notesEditor.addEventListener('input', function() {
+        clearTimeout(autoSaveTimer);
+        autoSaveTimer = setTimeout(function() {
+            if (!playerInfo.courseName || !notesFolder) return;
+            var txt = notesEditor.innerText;
+            if (!txt.trim() || txt === lastSavedContent) return;
+            pywebview.api.notes_save(playerInfo.courseName, playerInfo.title, playerInfo.videoIndex, txt, playerInfo.isYoutube, playerInfo.url).then(function(res) {
+                if (res.success) { lastSavedContent = txt; parseAndHighlightTimestamps(); }
+            }).catch(function() {});
+        }, 3000);
+    });
+
+    function insertTimestamp() {
+        const ts = fmtTime(videoEl.currentTime || 0);
+        notesEditor.focus();
+        const sel = window.getSelection();
+        if (sel.rangeCount && notesEditor.contains(sel.anchorNode)) {
+            const range = sel.getRangeAt(0);
+            range.deleteContents();
+            const textNode = document.createTextNode('\n## [' + ts + '] ');
+            range.insertNode(textNode);
+            range.setStartAfter(textNode);
+            range.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }
+        notesEditor.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function showSavedToast(msg) {
+        const badge = document.createElement('span');
+        badge.className = 'notes-badge saved';
+        badge.innerText = msg;
+        const footer = document.querySelector('.notes-footer');
+        const old = footer.querySelector('.saved');
+        if (old) old.remove();
+        footer.appendChild(badge);
+        setTimeout(() => { if (badge.parentNode) badge.remove(); }, 2500);
+    }
+
+    // ========== FULLSCREEN ==========
+    function toggleFullscreen(){
+        const player = document.getElementById('player-wrapper');
+        if(!player.classList.contains('active')) return;
+        if(document.fullscreenElement){document.exitFullscreen();}
+        else{player.requestFullscreen().catch(()=>{});}
+    }
+    document.addEventListener('fullscreenchange',()=>{
+        isFullscreen = !!document.fullscreenElement;
+        if(isFullscreen) document.body.classList.add('fullscreen');
+        else document.body.classList.remove('fullscreen');
+    });
+
+    // ========== SHORTCUTS HELP (Shift+?) ==========
+    function showShortcuts(){
+        const html = `<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem 2rem;font-size:0.85rem;">
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Play/Pause</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Space</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Fullscreen</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">F</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Notes Panel</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Ctrl+N</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Mute</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">M</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Seek Back 5s</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">&larr;</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Seek Forward 5s</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">&rarr;</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Close Player</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Esc</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Dark/Light Theme</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">T</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Screenshot</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">S</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Show Shortcuts</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Shift+?</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Timestamp Insert</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Ctrl+T</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Seek to End</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">End</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Toggle Mode</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">O</kbd></div>
+        </div>`;
+        document.getElementById('shortcuts-content').innerHTML=html;
+        openModal('modal-shortcuts');
+    }
+
+    // ========== KEYBOARD SHORTCUTS ==========
+    document.addEventListener('keydown',(e)=>{
+        if(e.key==='?'&&e.shiftKey){e.preventDefault();showShortcuts();return;}
+        if(e.key.toLowerCase()==='n'&&e.ctrlKey){
+            if(!document.getElementById('player-wrapper').classList.contains('active'))return;
+            e.preventDefault();toggleNotesPanel();return;
+        }
+        if(notesOpen){
+            if(e.key.toLowerCase()==='t'&&e.ctrlKey){e.preventDefault();insertTimestamp();}
+            if(e.key==='Escape'){e.preventDefault();toggleNotesPanel();}
+            return;
+        }
+        if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT'){if(e.key==='Escape'){e.target.blur();return;}return;}
+        switch(e.key.toLowerCase()){
+            case'f':e.preventDefault();toggleFullscreen();break;
+            case'escape':e.preventDefault();if(document.getElementById('player-wrapper').classList.contains('active'))closePlayer();else document.querySelectorAll('.modal-overlay.active').forEach(m=>closeModal(m.id));break;
+            case' ':e.preventDefault();if(document.getElementById('player-wrapper').classList.contains('active'))playerToggle();break;
+            case'arrowleft':if(document.getElementById('player-wrapper').classList.contains('active')){e.preventDefault();playerSeekRel(-5);}break;
+            case'arrowright':if(document.getElementById('player-wrapper').classList.contains('active')){e.preventDefault();playerSeekRel(5);}break;
+            case'm':if(document.getElementById('player-wrapper').classList.contains('active')){e.preventDefault();playerMute();}break;
+            case't':e.preventDefault();toggleTheme();break;
+            case's':e.preventDefault();takeScreenshot();break;
+            case'o':e.preventDefault();toggleNetworkMode();break;
+            case'end':e.preventDefault();if(document.getElementById('player-wrapper').classList.contains('active')){
+                if(!playerInfo.isYoutube&&videoEl.src&&videoEl.duration){videoEl.currentTime=videoEl.duration;}
+            }break;
+        }
+    });
+
+    // ========== INIT ==========
+    window.addEventListener('pywebviewready',()=>{
+        pywebview.api.get_app_info().then(info=>{
+            document.documentElement.className=info.theme;
+            if(info.notes_folder)notesFolder=info.notes_folder;
+            pywebview.api.get_courses_sync('offline').then(render).catch(e=>console.error(e));
+        }).catch(()=>{pywebview.api.get_courses_sync('offline').then(render).catch(e=>console.error(e));});
     });
 </script>
+<div class="spell-menu hidden" id="spell-menu"></div>
 </body>
 </html>
 """
 
 if __name__ == '__main__':
+    print("=== CourseTracker Pro v2 ===", flush=True)
+    print(f"Database: {DB_DIR}", flush=True)
+
+    port, server = start_file_server()
+    if port:
+        print(f"File server: http://127.0.0.1:{port}", flush=True)
+    else:
+        print("Warning: Could not start file server, local video playback may not work", flush=True)
+
     api = Api()
+    if port: api.set_file_port(port)
+
     cfg = get_settings()
     html = HTML_TEMPLATE.replace('__THEME__', cfg.get('theme', 'dark'))
     window = webview.create_window('CourseTracker Pro', html=html, js_api=api, width=1300, height=850)
-    api._window = window 
-    webview.start()
+    api._window = window
+    webview.start(debug=False)
