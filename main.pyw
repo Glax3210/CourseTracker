@@ -13,14 +13,12 @@ import socketserver
 import urllib.parse
 from datetime import date, datetime, timedelta
 
-APP_NAME = "CourseTrackerPro"
-app_data = os.getenv('LOCALAPPDATA') or os.path.expanduser("~")
-DB_DIR = os.path.join(app_data, APP_NAME)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.path.join(BASE_DIR, 'data')
 if not os.path.exists(DB_DIR): os.makedirs(DB_DIR)
 
 DATA_PATH = os.path.join(DB_DIR, "courses.json")
 SETTINGS_PATH = os.path.join(DB_DIR, "settings.json")
-NOTES_CONFIG_PATH = os.path.join(DB_DIR, "notes_config.json")
 
 def get_settings():
     if os.path.exists(SETTINGS_PATH):
@@ -44,13 +42,30 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "yt-dlp"])
     import yt_dlp
 
+COOKIE_FILE = os.path.join(DB_DIR, "youtube_cookies.txt")
+_oauth_lock = threading.Lock()
+_oauth_needed = False
+
 try:
     from spellchecker import SpellChecker
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pyspellchecker"])
     from spellchecker import SpellChecker
 
-spell = SpellChecker()
+_spell = None
+
+def _get_spell():
+    global _spell
+    if _spell is None:
+        try:
+            _spell = SpellChecker(language='en')
+            _spell.word_frequency.load_dictionary()
+        except Exception:
+            try:
+                _spell = SpellChecker()
+            except Exception:
+                _spell = False
+    return _spell if _spell is not False else None
 
 # =========================================================================
 # LOCAL FILE SERVER (serves videos to webview without CORS issues)
@@ -107,16 +122,13 @@ class NotesManager:
         self._load_config()
 
     def _load_config(self):
-        if os.path.exists(NOTES_CONFIG_PATH):
-            try:
-                with open(NOTES_CONFIG_PATH, 'r') as f:
-                    c = json.load(f)
-                    self.notes_folder = c.get('folder', '')
-            except: pass
+        s = get_settings()
+        self.notes_folder = s.get('notes_folder', '')
 
     def _save_config(self):
-        with open(NOTES_CONFIG_PATH, 'w') as f:
-            json.dump({'folder': self.notes_folder}, f)
+        s = get_settings()
+        s['notes_folder'] = self.notes_folder
+        save_settings(s)
 
     def set_folder(self, folder):
         self.notes_folder = folder
@@ -135,10 +147,7 @@ class NotesManager:
         base, _ = os.path.splitext(video_title or 'note')
         fn = f"{self._sanitize(base)}.md"
         p = os.path.join(d, fn)
-        h = f"# {video_title or 'Note'}\n**Course:** {course_name}  \n**Video:** {video_index}  \n"
-        if is_youtube and youtube_url: h += f"\n![]({youtube_url})\n"
-        h += "\n"
-        with open(p, 'w', encoding='utf-8') as f: f.write(h + content)
+        with open(p, 'w', encoding='utf-8') as f: f.write(content)
         return p
 
     def load_note(self, course_name, video_title, video_index):
@@ -149,9 +158,7 @@ class NotesManager:
         p = os.path.join(d, fn)
         if not os.path.exists(p): return ""
         with open(p, 'r', encoding='utf-8') as f:
-            c = f.read()
-        i = c.index('\n\n') if '\n\n' in c else 0
-        return c[i + 2:] if i else c
+            return f.read()
 
     def save_screenshot(self, course_name, video_title, img_b64):
         if not self.notes_folder: return ""
@@ -169,6 +176,17 @@ class NotesManager:
 # =========================================================================
 # COURSE MANAGER
 # =========================================================================
+def _ydl_opts(fmt='best[height<=1080]/best', flat=False, **extra):
+    opts = {'quiet': True, 'no_warnings': True, 'socket_timeout': 15, **extra}
+    if flat:
+        opts['extract_flat'] = 'in_playlist'
+        opts['ignoreerrors'] = True
+    else:
+        opts['format'] = fmt
+    if os.path.exists(COOKIE_FILE):
+        opts['cookiefile'] = COOKIE_FILE
+    return opts
+
 class CourseManager:
     def __init__(self):
         self.session_cache = {} 
@@ -199,7 +217,7 @@ class CourseManager:
 
     def fetch_online_videos(self, url):
         try:
-            ydl_opts = {'extract_flat': 'in_playlist', 'quiet': True, 'no_warnings': True, 'ignoreerrors': True}
+            ydl_opts = _ydl_opts(flat=True)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if not info: return[url]
@@ -300,9 +318,22 @@ class Api:
         self.nm = NotesManager()
         self._window = None 
         self._file_port = None
+        self._quality_cache = {}
 
     def set_file_port(self, port):
         self._file_port = port
+
+    def youtube_login(self):
+        try:
+            opts = {'quiet': True, 'username': 'oauth', 'password': '', 'cookiefile': COOKIE_FILE}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info('https://www.youtube.com', download=False)
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)[:150]}
+
+    def cookies_exist(self):
+        return os.path.exists(COOKIE_FILE)
 
     # --- original ---
     def open_link(self, url): webbrowser.open(url)
@@ -363,7 +394,7 @@ class Api:
 
     def fetch_meta(self, url):
         try:
-            ydl_opts = {'extract_flat': 'in_playlist', 'quiet': True}
+            ydl_opts = _ydl_opts(flat=True)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 title = info.get('title', 'Online Course')
@@ -466,24 +497,56 @@ class Api:
         name = c['name'] if c else ''
         if target.startswith('http'):
             try:
-                ydl_opts = {'quiet': True, 'no_warnings': True, 'format': 'best[height<=1080]/best', 'socket_timeout': 15}
+                ydl_opts = _ydl_opts()
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(target, download=False)
                     stream_url = info.get('url')
                     if stream_url:
+                        qualities = []
+                        seen_heights = set()
+                        for f in info.get('formats', []):
+                            vc = f.get('vcodec')
+                            h = f.get('height')
+                            if not h or h <= 0: continue
+                            if not vc or vc == 'none': continue
+                            ac = f.get('acodec')
+                            if not ac or ac == 'none': continue
+                            if h not in seen_heights:
+                                seen_heights.add(h)
+                                qualities.append({'label': f'{h}p', 'height': h, 'url': f.get('url', '')})
+                        if len(qualities) >= 1:
+                            qualities.sort(key=lambda q: q['height'], reverse=True)
+                            key = f'{course_id}_{video_index}'
+                            self._quality_cache[key] = {}
+                            for q in qualities:
+                                self._quality_cache[key][q['height']] = q['url']
+                        else:
+                            qualities = []
                         return {
                             'ok': True, 'is_youtube': False, 'url': stream_url,
                             'title': info.get('title', 'YouTube Video'),
-                            'course_name': name, 'video_index': video_index
+                            'course_name': name, 'video_index': video_index,
+                            'qualities': qualities
                         }
-            except: pass
-            return {'ok': True, 'is_youtube': True, 'url': target, 'course_name': name, 'video_index': video_index}
+            except Exception as e:
+                msg = str(e)
+                if 'sign in' in msg.lower() or 'bot' in msg.lower() or 'login' in msg.lower():
+                    return {'ok': False, 'error': msg[:120], 'needs_login': True}
+                return {'ok': False, 'error': msg[:120]}
+            return {'ok': False, 'error': 'Could not extract video stream'}
         if not os.path.exists(target): return {'ok': False, 'error': 'File not found'}
         local_url = f"http://127.0.0.1:{self._file_port}/video?f={urllib.parse.quote(target)}"
         return {
             'ok': True, 'is_youtube': False, 'url': local_url,
-            'title': os.path.basename(target), 'course_name': name, 'video_index': video_index
+            'title': os.path.basename(target), 'course_name': name, 'video_index': video_index,
+            'qualities': []
         }
+
+    def player_get_quality_url(self, course_id, video_index, height):
+        key = f'{course_id}_{video_index}'
+        cache = self._quality_cache.get(key, {})
+        url = cache.get(int(height), '')
+        return {'ok': bool(url), 'url': url} if url else {'ok': False, 'error': 'Quality not available'}
 
     # --- notes ---
     def notes_set_folder(self, folder): self.nm.set_folder(folder); return True
@@ -493,20 +556,37 @@ class Api:
         return {'path': path, 'success': bool(path)}
     def notes_load(self, course_name, video_title, video_index):
         return {'content': self.nm.load_note(course_name, video_title, int(video_index))}
-    def notes_save_image(self, course_name, video_title, img_b64):
-        path = self.nm.save_screenshot(course_name, video_title, img_b64)
-        return {'path': path}
+    def play_out(self, course_id, video_index):
+        target = self.cm.get_video_abs_path(course_id, video_index)
+        if target is None:
+            return {'ok': False, 'error': 'Lesson not found'}
+        os.startfile(target)
+        return {'ok': True}
 
     def js_log(self, msg): print(f"[JS] {msg}", flush=True)
 
-    def spell_check(self, word):
+    def show_popup(self, title, message, icon='error'):
+        import ctypes
+        MB_ICONS = {'error': 0x10, 'warning': 0x30, 'info': 0x40, 'question': 0x20}
+        flags = MB_ICONS.get(icon, 0x10) | 0x0
         try:
-            if not word or len(word) < 3:
+            ctypes.windll.user32.MessageBoxW(0, str(message), str(title), flags)
+        except Exception:
+            pass
+        return True
+
+    def spell_check(self, word):
+        s = _get_spell()
+        if s is None:
+            return {'known': True, 'suggestions': []}
+        try:
+            if not word or len(word.strip()) < 2:
                 return {'known': True, 'suggestions': []}
-            known = word in spell
-            sugs = list(spell.candidates(word))[:5] if not known else []
+            w = word.strip().lower()
+            known = w in s
+            sugs = list(s.candidates(w))[:5] if not known else []
             return {'known': known, 'suggestions': sugs}
-        except:
+        except Exception:
             return {'known': True, 'suggestions': []}
 
 # =========================================================================
@@ -589,7 +669,7 @@ HTML_TEMPLATE = r"""
         .strike-badge { position: absolute; top: -12px; right: -12px; background: var(--danger); color: white; padding: 0.5rem 1rem; border-radius: 2rem; font-size: 0.7rem; font-weight: 900; z-index: 20; display: flex; align-items: center; gap: 0.5rem; box-shadow: 0 4px 15px rgba(239,68,68,0.4); cursor: pointer; animation: shake 0.4s infinite; border: none; outline: none; }
         .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; z-index: 1000; opacity: 0; pointer-events: none; transition: 0.2s ease-in-out; padding: 2rem; }
         .modal-overlay.active { opacity: 1; pointer-events: auto; }
-        #modal-confirm { z-index: 2000; }
+        #modal-confirm { z-index: 20000; }
         .modal-content { background: var(--glass); border: 1px solid var(--border); border-radius: 3rem; padding: 2.5rem; width: 100%; max-height: 90vh; overflow-y: auto; box-shadow: 0 25px 50px rgba(0,0,0,0.25); transform: scale(0.95) translateY(10px); transition: 0.3s cubic-bezier(0.34,1.56,0.64,1); color: var(--text-main); }
         .modal-overlay.active .modal-content { transform: scale(1) translateY(0); }
         .modal-sm { max-width: 400px; } .modal-md { max-width: 500px; } .modal-lg { max-width: 768px; }
@@ -624,8 +704,26 @@ HTML_TEMPLATE = r"""
         .player-btn { width: 36px; height: 36px; border-radius: 50%; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s; }
         .player-btn:hover { background: rgba(255,255,255,0.2); }
         .player-btn.large { width: 48px; height: 48px; }
-        .player-volume { display: flex; align-items: center; gap: 0.5rem; }
-        .player-volume input[type=range] { width: 80px; accent-color: var(--primary); }
+        .player-volume { position: relative; display: flex; align-items: center; padding-top: 90px; margin-top: -90px; }
+        .player-volume .vol-popup { display: none; position: absolute; bottom: 44px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.9); border: 1px solid rgba(255,255,255,0.15); border-radius: 1rem; padding: 0.75rem 0.5rem; z-index: 20; }
+        .player-volume:hover .vol-popup { display: flex; }
+        .player-volume .vol-popup input[type=range] { writing-mode: bt-lr; -webkit-appearance: slider-vertical; width: 6px; height: 80px; padding: 0; accent-color: var(--primary); }
+        .player-speed { position: relative; display: flex; align-items: center; }
+        .player-speed-btn { width: 38px; height: 38px; border-radius: 50%; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); color: white; font-size: 0.7rem; font-weight: 900; cursor: pointer; transition: 0.2s; display: flex; align-items: center; justify-content: center; }
+        .player-speed-btn:hover { background: rgba(255,255,255,0.25); transform: scale(1.1); }
+        .speed-menu { display: none; position: absolute; bottom: 48px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.92); border: 1px solid rgba(255,255,255,0.15); border-radius: 0.75rem; flex-direction: column; z-index: 20; min-width: 65px; overflow: hidden; }
+        .speed-menu.show { display: flex; }
+        .speed-menu-item { padding: 0.4rem 0.75rem; cursor: pointer; font-size: 0.72rem; font-weight: 700; color: rgba(255,255,255,0.7); white-space: nowrap; transition: 0.1s; text-align: center; }
+        .speed-menu-item:hover { background: rgba(255,255,255,0.15); color: white; }
+        .speed-menu-item.active { color: var(--primary); }
+        .player-quality { position: relative; display: flex; align-items: center; }
+        .player-quality .q-btn { width: 38px; height: 38px; border-radius: 50%; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); color: white; cursor: pointer; transition: 0.2s; display: flex; align-items: center; justify-content: center; }
+        .player-quality .q-btn:hover { background: rgba(255,255,255,0.25); transform: scale(1.1); }
+        .player-quality .q-btn svg { width: 16px; height: 16px; }
+        .q-menu { display: none; position: absolute; bottom: 48px; right: 50%; transform: translateX(50%); background: rgba(0,0,0,0.92); border: 1px solid rgba(255,255,255,0.15); border-radius: 0.75rem; flex-direction: column; z-index: 20; min-width: 75px; overflow: hidden; }
+        .q-menu.show { display: flex; }
+        .q-menu-item { padding: 0.4rem 0.9rem; cursor: pointer; font-size: 0.72rem; font-weight: 700; color: rgba(255,255,255,0.7); white-space: nowrap; transition: 0.1s; text-align: center; }
+        .q-menu-item:hover { background: rgba(255,255,255,0.15); color: white; }
         .notes-panel { position: absolute; top: 0; right: -420px; width: 420px; height: 100%; background: var(--notes-bg); border-left: 1px solid var(--border); z-index: 50; transition: right 0.3s cubic-bezier(0.4,0,0.2,1); display: flex; flex-direction: column; box-shadow: -10px 0 40px rgba(0,0,0,0.3); }
         .notes-panel.open { right: 0; }
         .notes-header { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); }
@@ -674,6 +772,10 @@ HTML_TEMPLATE = r"""
         <button onclick="toggleTheme()" class="btn-icon" title="Theme (T)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
         </button>
+        <button onclick="youtubeLogin()" id="btn-login" class="btn-icon" title="Login to YouTube" style="display:flex;font-size:0.65rem;font-weight:900;width:auto;padding:0 1rem;border-radius:2rem;gap:0.4rem;">
+            <svg viewBox="0 0 24 24" fill="currentColor" style="width:14px;height:14px;"><path d="M23.5 6.2a3 3 0 00-2.1-2.1C19.5 3.5 12 3.5 12 3.5s-7.5 0-9.4.6A3 3 0 00.5 6.2 31.5 31.5 0 000 12a31.5 31.5 0 00.5 5.8 3 3 0 002.1 2.1c1.9.6 9.4.6 9.4.6s7.5 0 9.4-.6a3 3 0 002.1-2.1 31.5 31.5 0 00.5-5.8 31.5 31.5 0 00-.5-5.8z"/><polygon points="9.5 8.5 16 12 9.5 15.5 9.5 8.5" fill="white"/></svg>
+            Login
+        </button>
     </div>
 </nav>
 
@@ -681,8 +783,8 @@ HTML_TEMPLATE = r"""
     <div class="player-header">
         <h3 id="player-title">No video loaded</h3>
         <div style="display:flex;align-items:center;gap:0.75rem;">
-            <button onclick="takeScreenshot()" class="player-btn" title="Screenshot" style="width:28px;height:28px;">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            <button onclick="playOut()" class="player-btn" title="Play Out (P)" style="width:28px;height:28px;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
             </button>
             <button onclick="closePlayer()" class="player-btn" title="Close (Esc)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;"><path d="M18 6L6 18M6 6l12 12"/></svg>
@@ -708,11 +810,23 @@ HTML_TEMPLATE = r"""
             <div class="player-progress-fill" id="player-progress-fill"></div>
         </div>
         <span class="player-time" id="player-time-total">0:00</span>
-        <div class="player-volume">
-            <button onclick="playerMute()" class="player-btn" title="Mute (M)" style="width:28px;height:28px;">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 010 14.14M15.54 8.46a5 5 0 010 7.07"/></svg>
+        <div class="player-volume" id="player-volume-wrap">
+            <button onclick="playerMute()" class="player-btn" id="btn-mute" title="Mute (M)" style="width:28px;height:28px;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><polygon id="mute-speaker" points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path id="mute-waves" d="M19.07 4.93a10 10 0 010 14.14M15.54 8.46a5 5 0 010 7.07"/></svg>
             </button>
-            <input type="range" id="player-volume" min="0" max="100" value="80" oninput="playerSetVolume(this.value)" />
+            <div class="vol-popup" id="vol-popup">
+                <input type="range" id="player-volume" min="0" max="100" value="80" oninput="playerSetVolume(this.value)" />
+            </div>
+        </div>
+        <div class="player-speed">
+            <button onclick="toggleSpeedMenu(event)" class="player-speed-btn" id="speed-btn" title="Speed (Shift+&lt; / Shift+&gt;)">1x</button>
+            <div class="speed-menu" id="speed-menu"></div>
+        </div>
+        <div class="player-quality" id="quality-wrap" style="display:none;">
+            <button onclick="toggleQMenu(event)" class="q-btn" title="Quality">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+            </button>
+            <div class="q-menu" id="q-menu"></div>
         </div>
     </div>
     <div class="notes-panel" id="notes-panel">
@@ -721,6 +835,7 @@ HTML_TEMPLATE = r"""
             <div style="display:flex;align-items:center;gap:0.5rem;">
                 <span class="notes-badge" id="notes-timestamp">0:00</span>
                 <button onclick="insertTimestamp()" class="btn btn-xs btn-outline" style="border:1px solid var(--border);">TS</button>
+                <button onclick="correctAllNotes()" id="btn-correct-all" class="btn btn-xs btn-outline" title="Correct spelling & grammar via LanguageTool" style="border:1px solid var(--border);color:var(--success);">Correct</button>
             </div>
         </div>
         <div class="notes-body">
@@ -842,9 +957,29 @@ HTML_TEMPLATE = r"""
     };
 
     let courses =[], confirmCb=null, appMode='offline', notesOpen=false, isFullscreen=false, notesFolder='';
-    let playerInfo={courseId:'',videoIndex:0,courseName:'',title:'',isYoutube:false,url:''};
+    let playerInfo={courseId:'',videoIndex:0,courseName:'',title:'',isYoutube:false,url:'',qualities:[]};
 
     document.getElementById('mode-icon').innerHTML=ICONS.wifiOff;
+
+    async function youtubeLogin() {
+        const btn = document.getElementById('btn-login');
+        if (btn.disabled) return;
+        btn.disabled = true;
+        btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><path d="M21 2v6h-6M3 12a9 9 0 0115-6.7L21 8M3 22v-6h6M21 12a9 9 0 01-15 6.7L3 16"/></svg> Logging in...';
+        try {
+            const res = await pywebview.api.youtube_login();
+            if (res.ok) {
+                btn.style.display = 'none';
+                showSavedToast('Logged in!');
+            } else {
+                showError('Login Failed', res.error || 'Could not complete login.');
+            }
+        } catch(e) {
+            showError('Login Failed', 'Login process failed.');
+        }
+        btn.disabled = false;
+        btn.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" style="width:14px;height:14px;"><path d="M23.5 6.2a3 3 0 00-2.1-2.1C19.5 3.5 12 3.5 12 3.5s-7.5 0-9.4.6A3 3 0 00.5 6.2 31.5 31.5 0 000 12a31.5 31.5 0 00.5 5.8 3 3 0 002.1 2.1c1.9.6 9.4.6 9.4.6s7.5 0 9.4-.6a3 3 0 002.1-2.1 31.5 31.5 0 00.5-5.8 31.5 31.5 0 00-.5-5.8z"/><polygon points="9.5 8.5 16 12 9.5 15.5 9.5 8.5" fill="white"/></svg> Login';
+    }
 
     function openModal(id){
         if(id!=='modal-confirm'){document.querySelectorAll('.modal-overlay').forEach(m=>{if(m.id!=='modal-confirm')m.classList.remove('active')});}
@@ -897,7 +1032,6 @@ HTML_TEMPLATE = r"""
             card.innerHTML=`${strikeUI}
                 <div class="card-actions">
                     <button onclick="openProgressGrid('${c.id}')" title="Grid" class="card-action-btn">${ICONS.grid}</button>
-                    <button onclick="openPlayer('${c.id}',${c.last_index})" title="Play in App" class="card-action-btn player">${ICONS.play}</button>
                     <button onclick="openEdit('${c.id}')" title="Edit" class="card-action-btn">${ICONS.edit}</button>
                     <button onclick="delC('${c.id}')" title="Delete" class="card-action-btn delete">${ICONS.delete}</button>
                 </div>
@@ -1009,6 +1143,7 @@ HTML_TEMPLATE = r"""
     videoEl.addEventListener('pause',()=>{playBtn.innerHTML=ICONS.play;});
     videoEl.addEventListener('ended',()=>{
         playBtn.innerHTML=ICONS.play;
+        if(document.fullscreenElement) document.exitFullscreen();
         if(playerInfo.courseId){
             openConfirm("Video Complete","Did you complete the full lesson? This updates your daily count.","success",()=>{
                 pywebview.api.mark(playerInfo.courseId,appMode).then(render).catch(e=>console.error(e));
@@ -1026,45 +1161,110 @@ HTML_TEMPLATE = r"""
         document.getElementById('player-wrapper').classList.add('active');
         document.getElementById('player-wrapper').scrollIntoView({behavior:'smooth'});
         pywebview.api.player_get_video(courseId,videoIndex).then(res=>{
-            if(!res.ok){document.getElementById('player-title').innerText=res.error;return;}
-            playerInfo.title=res.title||'';playerInfo.isYoutube=res.is_youtube||false;playerInfo.url=res.url||'';
+            if(!res.ok){
+                if(res.needs_login){
+                    document.getElementById('btn-login').style.display='flex';
+                }
+                showError('Error', res.error||'Failed to load');
+                document.getElementById('player-title').innerText=res.error||'Failed to load';return;
+            }
+            playerInfo.title=res.title||'';playerInfo.isYoutube=res.is_youtube||false;playerInfo.url=res.url||'';playerInfo.qualities=res.qualities||[];
+            document.getElementById('quality-wrap').style.display=(playerInfo.qualities.length>=1?'flex':'none');
             document.getElementById('player-title').innerText=playerInfo.title||playerInfo.url;
             document.getElementById('notes-video-label').innerText=playerInfo.title||'Video playing';
             document.getElementById('notes-course-name').innerText=playerInfo.courseName;
-            if(playerInfo.isYoutube){
-                videoEl.style.display='none';videoEl.pause();ytWrap.style.display='block';
-                const vidId=getYoutubeId(playerInfo.url);
-                ytWrap.innerHTML=`<iframe src="https://www.youtube-nocookie.com/embed/${vidId}?autoplay=1&enablejsapi=1&origin=http://localhost&rel=0" allow="autoplay;encrypted-media;picture-in-picture;fullscreen" allowfullscreen></iframe>`;
-                playBtn.innerHTML=ICONS.pauseIcon;
-            }else{
-                ytWrap.style.display='none';ytWrap.innerHTML='';videoEl.style.display='block';
-                videoEl.src=playerInfo.url;videoEl.play().catch(()=>{});playBtn.innerHTML=ICONS.pauseIcon;
-            }
+            ytWrap.style.display='none';ytWrap.innerHTML='';videoEl.style.display='block';
+            videoEl.src=playerInfo.url;videoEl.play().catch(()=>{});playBtn.innerHTML=ICONS.pauseIcon;
             loadNotesForCurrentVideo();
         }).catch(e=>console.error(e));
     }
-    function getYoutubeId(url){
-        let m=url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([\w-]{11})/);
-        if(m)return m[1];
-        m=url.match(/(?:v=|iy\/)([\w-]{11})(?:&|$|%|#|\?)/);
-        return m?m[1]:url;
-    }
     function closePlayer(){
-        videoEl.pause();videoEl.src='';videoEl.style.display='none';ytWrap.innerHTML='';ytWrap.style.display='none';
+        videoEl.pause();videoEl.src='';videoEl.style.display='none';
         document.getElementById('player-wrapper').classList.remove('active');playBtn.innerHTML=ICONS.play;
         if(notesOpen){notesOpen=false;document.getElementById('notes-panel').classList.remove('open');}
-        playerInfo={courseId:'',videoIndex:0,courseName:'',title:'',isYoutube:false,url:''};
+        playerInfo={courseId:'',videoIndex:0,courseName:'',title:'',isYoutube:false,url:'',qualities:[]};
     }
     function playerToggle(){
-        if(playerInfo.isYoutube){const iframe=ytWrap.querySelector('iframe');if(iframe){
-            if(playBtn.innerHTML.includes('pauseIcon')||playBtn.innerHTML.includes('rect')){iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}','*');playBtn.innerHTML=ICONS.play;}
-            else{iframe.contentWindow.postMessage('{"event":"command","func":"playVideo","args":""}','*');playBtn.innerHTML=ICONS.pauseIcon;}
-        }}else if(videoEl.src){if(videoEl.paused)videoEl.play().catch(()=>{});else videoEl.pause();}
+        if(videoEl.src){if(videoEl.paused)videoEl.play().catch(()=>{});else videoEl.pause();}
     }
-    function playerSeekRel(sec){if(!playerInfo.isYoutube)videoEl.currentTime=Math.max(0,videoEl.currentTime+sec);}
-    function playerClickSeek(e){if(playerInfo.isYoutube)return;const bar=document.getElementById('player-progress-bar');videoEl.currentTime=((e.clientX-bar.getBoundingClientRect().left)/bar.offsetWidth)*videoEl.duration;}
+    function playerSeekRel(sec){videoEl.currentTime=Math.max(0,videoEl.currentTime+sec);}
+    function playerClickSeek(e){const bar=document.getElementById('player-progress-bar');videoEl.currentTime=((e.clientX-bar.getBoundingClientRect().left)/bar.offsetWidth)*videoEl.duration;}
     function playerSetVolume(val){videoEl.volume=val/100;}
-    function playerMute(){videoEl.muted=!videoEl.muted;}
+    function playerMute(){
+        videoEl.muted=!videoEl.muted;
+        const waves = document.getElementById('mute-waves');
+        const btn = document.getElementById('btn-mute');
+        if(videoEl.muted){
+            waves.setAttribute('stroke','#ef4444');
+            btn.style.borderColor='rgba(239,68,68,0.5)';
+            btn.style.background='rgba(239,68,68,0.2)';
+        }else{
+            waves.setAttribute('stroke','currentColor');
+            btn.style.borderColor='';
+            btn.style.background='';
+        }
+    }
+    const SPEEDS = [0.5, 1, 2, 3, 4, 5];
+    let currentSpeed = 1;
+    function buildSpeedMenu() {
+        const menu = document.getElementById('speed-menu');
+        menu.innerHTML = SPEEDS.map(s => `<div class="speed-menu-item${s===currentSpeed?' active':''}" onclick="setSpeed(${s})">${s}x</div>`).join('');
+    }
+    function setSpeed(s) {
+        currentSpeed = s;
+        videoEl.playbackRate = s;
+        document.getElementById('speed-btn').innerText = s + 'x';
+        document.getElementById('speed-menu').classList.remove('show');
+    }
+    function cycleSpeed(dir) {
+        let idx = SPEEDS.indexOf(currentSpeed);
+        if (idx === -1) { idx = SPEEDS.indexOf(1); }
+        let newIdx = idx + dir;
+        if (newIdx < 0) newIdx = 0;
+        if (newIdx >= SPEEDS.length) newIdx = SPEEDS.length - 1;
+        setSpeed(SPEEDS[newIdx]);
+    }
+    function toggleSpeedMenu(e) {
+        e.stopPropagation();
+        const menu = document.getElementById('speed-menu');
+        if (!menu.classList.contains('show')) { buildSpeedMenu(); menu.classList.add('show'); }
+        else menu.classList.remove('show');
+    }
+    document.addEventListener('click', (e) => {
+        document.getElementById('speed-menu').classList.remove('show');
+        document.getElementById('q-menu').classList.remove('show');
+    });
+    function buildQMenu() {
+        const menu = document.getElementById('q-menu');
+        menu.innerHTML = playerInfo.qualities.map(q =>
+            `<div class="q-menu-item" onclick="switchQ(${q.height})">${q.label}</div>`
+        ).join('');
+    }
+    function switchQ(height) {
+        if (!videoEl.src) return;
+        const btn = document.querySelector('.q-btn');
+        btn.style.opacity = '0.5';
+        pywebview.api.player_get_quality_url(playerInfo.courseId, playerInfo.videoIndex, height).then(res => {
+            if (res.ok) {
+                const wasPlaying = !videoEl.paused;
+                const at = videoEl.currentTime;
+                videoEl.src = res.url;
+                videoEl.currentTime = at;
+                if (wasPlaying) videoEl.play().catch(() => {});
+                showSavedToast(height + 'p');
+            } else {
+                showError('Quality Switch Failed', res.error || 'Not available');
+            }
+        }).catch(() => { showError('Quality Switch Failed', 'Error fetching quality'); });
+        btn.style.opacity = '';
+        document.getElementById('q-menu').classList.remove('show');
+    }
+    function toggleQMenu(e) {
+        e.stopPropagation();
+        const menu = document.getElementById('q-menu');
+        if (!menu.classList.contains('show')) { buildQMenu(); menu.classList.add('show'); }
+        else menu.classList.remove('show');
+    }
     function updatePlayerTime(){
         const t=videoEl.currentTime,d=videoEl.duration;
         document.getElementById('player-time-curr').innerText=fmtTime(t);
@@ -1073,12 +1273,11 @@ HTML_TEMPLATE = r"""
     }
     function fmtTime(sec){if(!sec||isNaN(sec)||sec<0)return'0:00';const m=Math.floor(sec/60),s=Math.floor(sec%60);return m+':'+(s<10?'0':'')+s;}
 
-    function takeScreenshot(){
-        if(!playerInfo.isYoutube&&videoEl.src&&videoEl.videoWidth>0){try{
-            const canvas=document.createElement('canvas');canvas.width=videoEl.videoWidth;canvas.height=videoEl.videoHeight;
-            canvas.getContext('2d').drawImage(videoEl,0,0);
-            pywebview.api.notes_save_image(playerInfo.courseName,playerInfo.title||'screenshot',canvas.toDataURL('image/png')).then(res=>{if(res.path)showSavedToast('Screenshot saved!');}).catch(()=>{});
-        }catch(e){console.error(e);}}else showSavedToast('Screenshots only for local videos');
+    function playOut() {
+        if (!playerInfo.courseId) { showError('Play Out', 'Load a video first.'); return; }
+        pywebview.api.play_out(playerInfo.courseId, playerInfo.videoIndex).then(res => {
+            if (!res.ok) showError('Play Out', res.error || 'Could not open the lesson.');
+        }).catch(e => console.error(e));
     }
 
     // ========== NOTES PANEL (contenteditable with clickable timestamps) ==========
@@ -1239,8 +1438,8 @@ HTML_TEMPLATE = r"""
     }
 
     function saveNotes() {
-        if (!playerInfo.courseName) { alert('Load a video first to save notes.'); return; }
-        if (!notesFolder) { alert('Set a notes folder in the course settings first.'); return; }
+        if (!playerInfo.courseName) { showError('Cannot Save Notes', 'Load a video first to save notes.'); return; }
+        if (!notesFolder) { showError('Cannot Save Notes', 'Set a notes folder in the course settings first.'); return; }
         pywebview.api.notes_save(playerInfo.courseName, playerInfo.title, playerInfo.videoIndex, notesEditor.innerText, playerInfo.isYoutube, playerInfo.url).then(res => { if (res.success) showSavedToast('Notes saved!'); }).catch(e => console.error(e));
     }
 
@@ -1285,6 +1484,57 @@ HTML_TEMPLATE = r"""
         setTimeout(() => { if (badge.parentNode) badge.remove(); }, 2500);
     }
 
+    function showError(title, message) {
+        pywebview.api.show_popup(title, message, 'error').catch(() => {
+            alert(title + '\n\n' + message);
+        });
+    }
+
+    // ========== LANGUAGE TOOL SPELLING & GRAMMAR CORRECTION ==========
+    async function correctAllNotes() {
+        const editor = document.getElementById('notes-editor');
+        const text = editor.innerText;
+        if (!text.trim()) {
+            pywebview.api.show_popup('Nothing to Correct', 'The notes editor is empty.', 'info').catch(() => {});
+            return;
+        }
+        const btn = document.getElementById('btn-correct-all');
+        const origText = btn.innerText;
+        btn.disabled = true;
+        btn.innerText = '...';
+        try {
+            const resp = await fetch('https://api.languagetool.org/v2/check', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({ text: text, language: 'en-US' })
+            });
+            if (!resp.ok) {
+                if (resp.status === 429) throw new Error('LanguageTool rate limit reached. Please wait a minute and try again.');
+                if (resp.status >= 500) throw new Error('LanguageTool server is temporarily unavailable. Try again later.');
+                throw new Error('LanguageTool API error (HTTP ' + resp.status + ').');
+            }
+            const data = await resp.json();
+            const matches = (data.matches || []).filter(m => m.replacements && m.replacements.length > 0);
+            if (matches.length === 0) { showSavedToast('No corrections needed.'); return; }
+            let corrected = text;
+            const sorted = [...matches].sort((a, b) => b.offset - a.offset);
+            for (const m of sorted) {
+                const rep = m.replacements[0].value;
+                corrected = corrected.substring(0, m.offset) + rep + corrected.substring(m.offset + m.length);
+            }
+            editor.innerText = corrected;
+            lastParsedHTML = ''; lastParsedText = ''; lastSavedContent = '';
+            parseAndHighlightTimestamps();
+            editor.dispatchEvent(new Event('input', { bubbles: true }));
+            showSavedToast(matches.length + ' correction(s) applied!');
+        } catch (err) {
+            showError('Correction Failed', err.message || 'Unable to reach LanguageTool.');
+        } finally {
+            btn.disabled = false;
+            btn.innerText = origText;
+        }
+    }
+
     // ========== FULLSCREEN ==========
     function toggleFullscreen(){
         const player = document.getElementById('player-wrapper');
@@ -1309,11 +1559,13 @@ HTML_TEMPLATE = r"""
             <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Seek Forward 5s</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">&rarr;</kbd></div>
             <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Close Player</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Esc</kbd></div>
             <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Dark/Light Theme</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">T</kbd></div>
-            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Screenshot</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">S</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Play Out</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">S</kbd></div>
             <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Show Shortcuts</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Shift+?</kbd></div>
             <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Timestamp Insert</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Ctrl+T</kbd></div>
             <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Seek to End</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">End</kbd></div>
             <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Toggle Mode</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">O</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Speed Down</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Shift+,</kbd></div>
+            <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border);"><span>Speed Up</span><kbd style="background:var(--input-bg);border:1px solid var(--border);padding:0.15rem 0.5rem;border-radius:0.3rem;font-family:monospace;color:var(--primary);">Shift+.</kbd></div>
         </div>`;
         document.getElementById('shortcuts-content').innerHTML=html;
         openModal('modal-shortcuts');
@@ -1321,7 +1573,6 @@ HTML_TEMPLATE = r"""
 
     // ========== KEYBOARD SHORTCUTS ==========
     document.addEventListener('keydown',(e)=>{
-        if(e.key==='?'&&e.shiftKey){e.preventDefault();showShortcuts();return;}
         if(e.key.toLowerCase()==='n'&&e.ctrlKey){
             if(!document.getElementById('player-wrapper').classList.contains('active'))return;
             e.preventDefault();toggleNotesPanel();return;
@@ -1331,7 +1582,12 @@ HTML_TEMPLATE = r"""
             if(e.key==='Escape'){e.preventDefault();toggleNotesPanel();}
             return;
         }
+        if(e.key==='?'&&e.shiftKey){e.preventDefault();showShortcuts();return;}
         if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT'){if(e.key==='Escape'){e.target.blur();return;}return;}
+        if(e.shiftKey){
+            if(e.key===','||e.key==='<'){e.preventDefault();cycleSpeed(-1);return;}
+            if(e.key==='.'||e.key==='>'){e.preventDefault();cycleSpeed(1);return;}
+        }
         switch(e.key.toLowerCase()){
             case'f':e.preventDefault();toggleFullscreen();break;
             case'escape':e.preventDefault();if(document.getElementById('player-wrapper').classList.contains('active'))closePlayer();else document.querySelectorAll('.modal-overlay.active').forEach(m=>closeModal(m.id));break;
@@ -1340,16 +1596,19 @@ HTML_TEMPLATE = r"""
             case'arrowright':if(document.getElementById('player-wrapper').classList.contains('active')){e.preventDefault();playerSeekRel(5);}break;
             case'm':if(document.getElementById('player-wrapper').classList.contains('active')){e.preventDefault();playerMute();}break;
             case't':e.preventDefault();toggleTheme();break;
-            case's':e.preventDefault();takeScreenshot();break;
+            case's':e.preventDefault();playOut();break;
             case'o':e.preventDefault();toggleNetworkMode();break;
             case'end':e.preventDefault();if(document.getElementById('player-wrapper').classList.contains('active')){
-                if(!playerInfo.isYoutube&&videoEl.src&&videoEl.duration){videoEl.currentTime=videoEl.duration;}
+                if(videoEl.src&&videoEl.duration){videoEl.currentTime=videoEl.duration;}
             }break;
         }
     });
 
     // ========== INIT ==========
     window.addEventListener('pywebviewready',()=>{
+        pywebview.api.cookies_exist().then(has=>{
+            if(has) document.getElementById('btn-login').style.display='none';
+        }).catch(()=>{});
         pywebview.api.get_app_info().then(info=>{
             document.documentElement.className=info.theme;
             if(info.notes_folder)notesFolder=info.notes_folder;
